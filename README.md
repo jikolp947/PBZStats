@@ -12,6 +12,23 @@ A HUD mod for **Phantom Blade Zero** that shows five lines at the right-middle o
 
 Data is read from the game's own runtime state (including the per-boss records stored in the save data), so the numbers are historical, not "since you installed the mod".
 
+## 中文简介
+
+影之刃零（Phantom Blade Zero）画面右侧中部的五行 HUD：**当前周目、当前难度、死亡总数、当前 Boss、本 Boss 死亡数**。
+
+数据读取游戏自身的运行时状态与存档记录（Boss 死亡 = 尝试次数 − 击杀次数），显示的是历史累计值，而不是"装了这个 mod 之后的次数"。不修改存档，不注入游戏进程。
+
+- **13 种语言自动跟随**游戏内语言：切换语言后几秒内自动刷新，无需重启游戏
+- 透明、鼠标穿透、不抢焦点，随游戏启动与退出，无后台进程、无 Python
+- 长 Boss 名自动省略号，不会超出屏幕
+- 只读：不修改存档与游戏文件
+
+**安装**：关闭游戏 → 解压 → 右键 `install.ps1` → 用 PowerShell 运行 → 从 Steam 正常启动游戏。
+**卸载**：运行 `uninstall.ps1`（加 `-KeepData` 可保留统计数据）。
+
+发布页与更新日志：https://www.nexusmods.com/phantombladezero/mods/268
+完整中文说明：`docs/README.md`
+
 ## Repository layout
 
 ```
