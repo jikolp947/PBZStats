@@ -1,0 +1,4 @@
+dist/
+data/
+*.zip
+*.exe.bak
