@@ -32,6 +32,11 @@
   All reads are passive. No game data is modified.
 ============================================================================]]
 
+-- Release version of the mod (shown in the tray notification and written to
+-- stats.txt/json so the HUD exe can display it). Keep in sync with install.ps1
+-- and the Nexus file version when publishing.
+local MOD_VERSION = "3.2.2"
+
 local OUT = "E:\\PBZModOut\\"
 local STATS_PATH = OUT .. "stats.json"
 local STATS_TXT = OUT .. "stats.txt"
@@ -1084,6 +1089,7 @@ local function writeStatsTxt()
         log("ERROR: cannot write " .. STATS_TXT)
         return
     end
+    f:write("version=" .. MOD_VERSION .. "\n")
     f:write("lang=" .. tostring(lang) .. "\n")
     for _, code in ipairs(LANG_ORDER) do
         local t = L10N[code]
@@ -1119,6 +1125,7 @@ local function writeStats(force)
         return
     end
     f:write("{\n")
+    f:write("  \"mod_version\": " .. jsonStr(MOD_VERSION) .. ",\n")
     f:write("  \"ts\": " .. t .. ",\n")
     f:write("  \"total_deaths\": " .. jsonNum(S.total) .. ",\n")
     f:write("  \"boss_deaths\": " .. jsonNum(S.bossDeaths) .. ",\n")
@@ -1406,7 +1413,7 @@ end
 -- boot
 -- ---------------------------------------------------------------------------
 local function boot()
-    log("========== PBZStats boot (v8.0) ==========")
+    log("========== PBZStats boot v" .. MOD_VERSION .. " (lua 8.0) ==========")
     loadBossCounts()
     local keys = {}
     for k in pairs(bossCounts) do keys[#keys + 1] = k end

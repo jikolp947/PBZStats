@@ -130,6 +130,7 @@ namespace PBZStatsHud
     internal sealed class Stats
     {
         public string Lang = "en";
+        public string Version = "";
         public DateTime Mtime;
         public readonly Dictionary<string, List<Row>> Sets =
             new Dictionary<string, List<Row>>(StringComparer.OrdinalIgnoreCase);
@@ -178,11 +179,24 @@ namespace PBZStatsHud
         private const string QuitEventName = @"Global\PBZStatsHUD_Quit";
         private const string WindowTitle = "PBZStatsHUD";
 
+        // Version shown in the tray tooltip/balloon. The Lua mod writes the real
+        // version into stats.txt ("version="), so an updated mod never leaves a
+        // stale number here; this is only the fallback before the first write.
+        internal const string FallbackVersion = "3.2.2";
+
         private static Config _cfg;
         private static string _exeDir;
         private static string _iniPath;
         private static string _dataDir;
         private static string _logPath;
+        private static NotifyIcon _tray;
+        private static string _trayVersion = "";
+        private static ContextMenuStrip _trayMenu;
+        private static ToolStripMenuItem _trayVersionItem;
+        // The render loop runs on a worker thread, so it only records the version it
+        // saw; the UI thread applies it. NotifyIcon must only be touched by the thread
+        // that created it, otherwise the tray menu can stop responding.
+        private static volatile string _pendingVersion = "";
 
         [STAThread]
         private static void Main(string[] args)
@@ -229,18 +243,35 @@ namespace PBZStatsHud
             {
                 EventWaitHandle quit = new EventWaitHandle(false, EventResetMode.ManualReset, QuitEventName);
                 bool preview = (flag == "--preview" || flag == "-preview");
-                NotifyIcon tray = null;
-                try { tray = CreateTray(cfg, quit); } catch { }
-                try
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                // The tray icon's context menu needs a real WinForms message loop, so
+                // this STA thread pumps messages and the render/poll loop runs on a
+                // worker thread. (Before this the loop owned the only thread, and the
+                // tray menu could be drawn but never answered clicks.)
+                using (HudContext ctx = new HudContext(cfg, quit))
                 {
-                    RunLoop(cfg, quit, preview);
-                }
-                finally
-                {
-                    if (tray != null)
+                    Thread worker = new Thread(delegate()
                     {
-                        try { tray.Visible = false; tray.Dispose(); } catch { }
-                    }
+                        try
+                        {
+                            RunLoop(cfg, quit, preview);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("run loop failed: " + ex.Message);
+                        }
+                        finally
+                        {
+                            try { quit.Set(); } catch { }
+                            ctx.PostExit();
+                        }
+                    });
+                    worker.IsBackground = true;
+                    worker.Name = "pbzstats-render";
+                    worker.Start();
+                    Application.Run(ctx);
                 }
             }
             finally
@@ -250,14 +281,61 @@ namespace PBZStatsHud
             }
         }
 
+        // The Lua mod writes the release version as the first line of stats.txt
+        // ("version=3.2.2"). Read it before the first poll so the startup
+        // notification can already show the right number.
+        private static string ReadModVersion()
+        {
+            try
+            {
+                string p = Path.Combine(_dataDir, "stats.txt");
+                if (File.Exists(p))
+                {
+                    foreach (string raw in File.ReadAllLines(p, Encoding.UTF8))
+                    {
+                        string line = raw.Trim();
+                        if (line.StartsWith("version=", StringComparison.Ordinal))
+                        {
+                            string v = line.Substring(8).Trim();
+                            if (v.Length > 0) return v;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return FallbackVersion;
+        }
+
         // A tray icon is the user's proof that the HUD is alive and the place to
         // close it: the HUD itself is a click-through window with no chrome.
         private static NotifyIcon CreateTray(Config cfg, EventWaitHandle quit)
         {
+            string ver = ReadModVersion();
+            _trayVersion = ver;
             NotifyIcon ni = new NotifyIcon();
             ni.Icon = System.Drawing.SystemIcons.Application;
-            ni.Text = "PBZStats HUD";
+            string trayText = "PBZStats HUD v" + ver;
+            if (trayText.Length > 63) trayText = trayText.Substring(0, 63); // NotifyIcon.Text limit
+            ni.Text = trayText;
             ContextMenuStrip menu = new ContextMenuStrip();
+            menu.ShowImageMargin = false;
+            ToolStripMenuItem verItem = new ToolStripMenuItem("PBZStats HUD v" + ver);
+            verItem.Enabled = false;
+            menu.Items.Add(verItem);
+            _trayMenu = menu;
+            _trayVersionItem = verItem;
+            // Refresh the header right before the menu opens (the worker thread may
+            // have learned the real version since startup).
+            menu.Opening += delegate
+            {
+                try
+                {
+                    string v = _pendingVersion;
+                    if (string.IsNullOrEmpty(v)) v = _trayVersion;
+                    if (!string.IsNullOrEmpty(v)) verItem.Text = "PBZStats HUD v" + v;
+                }
+                catch { }
+            };
             ToolStripMenuItem openItem = new ToolStripMenuItem("打开数据文件夹 / Open data folder");
             openItem.Click += delegate
             {
@@ -275,13 +353,81 @@ namespace PBZStatsHud
             bool game = IsGameRunning(cfg.ProcessName);
             try
             {
-                ni.ShowBalloonTip(3000, "PBZStats HUD",
+                ni.ShowBalloonTip(3000, "PBZStats HUD v" + ver,
                     game ? "已启动，正在显示游戏数据" : "已启动，等待游戏启动",
                     ToolTipIcon.Info);
             }
             catch { }
             Log("tray icon created, game running = " + game);
             return ni;
+        }
+
+        // Owns the UI thread: a hidden host form (so the worker thread can marshal
+        // updates back here), the tray icon, and a timer that applies version changes.
+        private sealed class HudContext : ApplicationContext
+        {
+            private readonly Form _host;
+            private readonly System.Windows.Forms.Timer _timer;
+            private bool _exited;
+
+            internal HudContext(Config cfg, EventWaitHandle quit)
+            {
+                _host = new Form();
+                _host.ShowInTaskbar = false;
+                _host.FormBorderStyle = FormBorderStyle.None;
+                _host.StartPosition = FormStartPosition.Manual;
+                _host.Location = new Point(-32000, -32000);
+                _host.Size = new Size(1, 1);
+                _host.Opacity = 0;
+                IntPtr forced = _host.Handle; // create the handle on this thread
+
+                try { _tray = CreateTray(cfg, quit); }
+                catch (Exception ex) { Log("tray icon failed: " + ex.Message); }
+
+                _timer = new System.Windows.Forms.Timer();
+                _timer.Interval = 500;
+                _timer.Tick += delegate { ApplyPendingTrayVersion(); };
+                _timer.Start();
+            }
+
+            internal void PostExit()
+            {
+                try
+                {
+                    if (_host != null && _host.IsHandleCreated)
+                        _host.BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (!_exited) { _exited = true; ExitThread(); }
+                        });
+                }
+                catch { }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    try { if (_timer != null) { _timer.Stop(); _timer.Dispose(); } } catch { }
+                    try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
+                    try { if (_host != null) _host.Dispose(); } catch { }
+                }
+                base.Dispose(disposing);
+            }
+        }
+
+        private static void ApplyPendingTrayVersion()
+        {
+            try
+            {
+                string v = _pendingVersion;
+                if (string.IsNullOrEmpty(v) || v == _trayVersion) return;
+                _trayVersion = v;
+                string text = "PBZStats HUD v" + v;
+                if (text.Length > 63) text = text.Substring(0, 63); // NotifyIcon.Text limit
+                if (_tray != null) _tray.Text = text;
+                if (_trayVersionItem != null) _trayVersionItem.Text = "PBZStats HUD v" + v;
+            }
+            catch { }
         }
 
         private static string ResolveDataDir(Config cfg)
@@ -447,6 +593,12 @@ namespace PBZStatsHud
                 }
                 catch { }
 
+                if (data != null && data.Version.Length > 0 && data.Version != _pendingVersion)
+                {
+                    // NotifyIcon is owned by the UI thread; the tray timer applies it.
+                    _pendingVersion = data.Version;
+                }
+
                 bool show = game && (data != null || preview);
                 if (preview && data == null) data = PreviewStats();
 
@@ -547,6 +699,7 @@ namespace PBZStatsHud
             {
                 string line = raw.TrimEnd('\r', '\n');
                 if (line.Length == 0) continue;
+                if (line.StartsWith("version=")) { d.Version = line.Substring(8).Trim(); continue; }
                 if (line.StartsWith("lang=")) { d.Lang = Stats.Normalize(line.Substring(5)); continue; }
                 int p = line.IndexOf('|');
                 if (p <= 0) continue;

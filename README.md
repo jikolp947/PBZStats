@@ -1,6 +1,6 @@
 # PBZStats — Death Counter HUD for Phantom Blade Zero
 
-Current release: **v3.2.1** — the HUD follows the in-game language live (switching the language in the options menu updates the overlay without a restart). User documentation: `docs/README.md`.
+Current release: **v3.2.2** — the HUD follows the in-game language live (switching the language in the options menu updates the overlay without a restart), shows its version in the startup notification and tray, and the installer/uninstaller print step-by-step status with a final RESULT line. User documentation: `docs/README.md`.
 
 A HUD mod for **Phantom Blade Zero** that shows five lines at the right-middle of the screen:
 

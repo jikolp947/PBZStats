@@ -1,4 +1,4 @@
-# PBZStats — Phantom Blade Zero death counter HUD (v3.2.1)
+# PBZStats — Phantom Blade Zero death counter HUD (v3.2.2)
 
 Shows five lines at the right-middle of the screen, in the game's own language:
 
@@ -31,6 +31,7 @@ Boss Deaths    24
 
 ### Installer behaviour
 
+* **Visible status**: every step prints `[n/8]`, each action prints `OK` / `WARN` / `FAIL`, and the run ends with `RESULT: INSTALL SUCCESSFUL`, `INSTALLED WITH WARNINGS` or `FAILED` (exit code 0 / 1). A full transcript is written to `%TEMP%\PBZStats_install_<timestamp>.log`, and double-clicking the script keeps the window open so you can read the result.
 * **First install**: if another `ue4ss\` or `dwmapi.dll` is present (another UE4SS mod), it is renamed to a backup before installing. At most two backups are kept, so nothing of yours is lost.
 * **Reinstall / update**: a `.pbzstats_version` marker identifies our own installation; it is updated in place without creating backups.
 * **`-NoBackup`**: for advanced users who explicitly want no backups at all (only when no other UE4SS mod is installed).
@@ -40,7 +41,8 @@ Manual install: copy `files\dwmapi.dll` and `files\ue4ss` into `<game>\platform\
 
 ## Uninstall
 
-Run `uninstall.ps1` (stops the HUD, removes `ue4ss\Mods\PBZStats` including `data\`, restores the renamed `dwmapi.dll`, removes `.pbzstats_version`). Use `-KeepData` to back up `stats.json`, `stats.txt` and logs to `%LOCALAPPDATA%\PBZStats_backup_<timestamp>` first.
+Run `uninstall.ps1` (stops the HUD, removes `ue4ss\Mods\PBZStats` including `data\`, restores the renamed `dwmapi.dll`, removes `.pbzstats_version`). Use `-KeepData` to back up `stats.json`, `stats.txt` and logs to `%LOCALAPPDATA%\PBZStats_backup_<timestamp>` first. It prints the same `[n/8]` / `OK` / `WARN` / `FAIL` lines and ends with `RESULT: UNINSTALL SUCCESSFUL`, `UNINSTALLED WITH WARNINGS` or `FAILED` (exit code 0 / 1), with a transcript in `%TEMP%\PBZStats_uninstall_<timestamp>.log`.
+
 
 ## Data sources
 
@@ -97,6 +99,8 @@ Fix: add `<game>\platform\steam\ue4ss\Mods\PBZStats` to the whitelist and run `i
 
 ## Changelog
 
+* v3.2.2 — the HUD version is now shown in the startup notification, the tray tooltip and the tray menu (read from `stats.txt`, so it always matches the installed files); installer and uninstaller print `[n/8]` step status with `OK` / `WARN` / `FAIL`, a final `RESULT:` verdict, an exit code and a transcript in `%TEMP%`; fixed the injector size check and the `-KeepData` backup folder.
+* v3.2.2 (tray fix) — the tray right-click menu no longer freezes: the render loop runs on a worker thread while the main thread keeps a real WinForms message loop, so the menu opens, responds and closes normally.
 * v3.2.1 — the HUD follows the in-game language live: the engine culture is re-read every few seconds, so switching the language in the options menu updates the overlay without a restart; boss names are shown in the language of the row they appear in.
 * v3.2.0 — long boss names clamped by pixel width with an ellipsis (`max_value_width`); installer gains `-NoBackup`, own-install marker and backup deduplication; docs updated (compatibility, truncation, installer behaviour).
 * v3.1.0 — tray icon + balloon startup feedback, tray menu to quit/open data folder; all data and logs moved into `data\`; fixed Simplified and Traditional Chinese showing at the same time.
