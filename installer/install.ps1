@@ -6,7 +6,7 @@
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $src  = Join-Path $here 'files'
-$version = '3.2.2'
+$version = '3.7.1'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logPath = Join-Path $env:TEMP ('PBZStats_install_' + $stamp + '.log')
 
@@ -247,6 +247,9 @@ try {
     Write-Step 'Installing HUD executable / 安装 HUD 程序'
     $hudDst = Join-Path $modDir 'PBZStatsHUD.exe'
     $hudBak = Join-Path $modDir 'hudbox.dat'
+    # Some packages (the Nexus download) intentionally ship without the optional
+    # overlay exe: the PowerShell host draws the HUD, so nothing has to be copied.
+    $packHasExe = (Test-Path (Join-Path $here 'PBZStatsHUD.exe')) -or (Test-Path (Join-Path $here 'hudbox.dat'))
     try {
         if (Test-Path (Join-Path $here 'PBZStatsHUD.exe')) {
             for ($i = 1; $i -le 3; $i++) {
@@ -261,6 +264,9 @@ try {
         } elseif (Test-Path (Join-Path $here 'hudbox.dat')) {
             try { [System.IO.File]::Copy((Join-Path $here 'hudbox.dat'), $hudBak, $true) } catch { }
             Write-Warn 'PBZStatsHUD.exe could not be written; the game will restore it from hudbox.dat'
+        } elseif (-not $packHasExe) {
+            Write-Ok 'no overlay exe in this package - the PowerShell host draws the HUD'
+            Write-Info 'this build is PowerShell only; grab the GitHub release if you want the optional exe'
         } else {
             Write-Fail 'neither PBZStatsHUD.exe nor hudbox.dat could be installed'
         }
@@ -332,6 +338,8 @@ try {
     Add-Check 'data folder' (Test-Path $dataDir) $dataDir
     if (Test-Path $hudDst) {
         Add-Check 'HUD exe' $true ('{0:N0} bytes' -f (Get-Item $hudDst).Length)
+    } elseif (-not $packHasExe) {
+        Add-Check 'HUD exe (optional)' $true 'not shipped in this build - PowerShell host only'
     } else {
         Write-Host '       WARN  HUD exe: missing - antivirus may have quarantined it' -ForegroundColor Yellow
         $script:warnings++
@@ -340,6 +348,13 @@ try {
     }
 
     # --- summary ----------------------------------------------------------
+    $hudMode = 'ps'
+    $iniDst = Join-Path $modDir 'PBZStatsHUD.ini'
+    if (Test-Path $iniDst) {
+        $mm = Select-String -Path $iniDst -Pattern '^\s*hud_mode\s*=\s*(\w+)' | Select-Object -First 1
+        if ($mm) { $hudMode = $mm.Matches[0].Groups[1].Value.ToLowerInvariant() }
+    }
+
     Write-Head 'INSTALL SUMMARY / 安装结果'
     foreach ($c in $script:checks) {
         $mark = if ($c.Ok) { '[ OK ]' } else { '[FAIL]' }
@@ -348,7 +363,9 @@ try {
     Write-Host ''
     Write-Host ('  injector : ' + $dll)
     Write-Host ('  script   : ' + $luaDst)
-    Write-Host ('  HUD      : ' + $hudDst + ' (started by the game)')
+    if ($hudMode -eq 'exe') { Write-Host ('  HUD      : ' + $hudDst + ' (started by the game)') }
+    elseif (Test-Path $hudDst) { Write-Host ('  HUD      : ' + $hudDst + ' (optional; PowerShell host is used by default)') }
+    else { Write-Host '  HUD      : not included (PowerShell host only, no exe on disk)' }
     Write-Host ('  data     : ' + $dataDir)
     Write-Host ('  log      : ' + $logPath)
     Write-Host ''
@@ -361,8 +378,13 @@ try {
         Write-Host 'RESULT: INSTALL SUCCESSFUL. 安装成功。' -ForegroundColor Green
     }
     Write-Host ''
-    Write-Host 'Start the game from Steam. The HUD appears on the right side and closes with the game.'
-    Write-Host '启动游戏后右侧会出现数据 HUD，退出游戏后自动关闭。'
+    if ($hudMode -eq 'exe') {
+        Write-Host 'Start the game from Steam. The overlay exe starts with the game and exits with it.'
+        Write-Host '启动游戏后右侧会出现数据 HUD（exe 版），退出游戏后自动关闭。'
+    } else {
+        Write-Host 'Start the game from Steam. The HUD is drawn by a PowerShell host that the mod starts for you - no exe, nothing to run manually.'
+        Write-Host '启动游戏后右侧会出现数据 HUD（PowerShell 宿主，无需 exe、无需额外操作），退出游戏后自动关闭。'
+    }
     Write-Host 'No Python, no autostart entry, no background watcher is installed.'
     Write-Host 'HUD language follows the game language automatically (edit lang= in PBZStatsHUD.ini to force one).'
     Write-Host 'Uninstall: run uninstall.ps1'

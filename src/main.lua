@@ -35,7 +35,7 @@
 -- Release version of the mod (shown in the tray notification and written to
 -- stats.txt/json so the HUD exe can display it). Keep in sync with install.ps1
 -- and the Nexus file version when publishing.
-local MOD_VERSION = "3.2.2"
+local MOD_VERSION = "3.7.1"
 
 local OUT = "E:\\PBZModOut\\"
 local STATS_PATH = OUT .. "stats.json"
@@ -70,6 +70,56 @@ local DIFF_NAMES_EN = {
     [3] = "Hard",
     [4] = "Nightmare",
 }
+
+-- Difficulty names per language. The game ships its own localized names; this
+-- table mirrors them so the HUD shows exactly the word the game shows. If your
+-- build words a difficulty differently, drop a plain text file
+-- data\hud_diffnames.txt with four lines (easy / normal / hard / nightmare) and
+-- the HUD uses those instead.
+local DIFF_BY_LANG = {
+    zh   = { [1] = "入阵者", [2] = "破局者", [3] = "逆天者", [4] = "六十六天" },
+    zht  = { [1] = "入陣者", [2] = "破局者", [3] = "逆天者", [4] = "六十六天" },
+    ja   = { [1] = "入陣者", [2] = "破局者", [3] = "逆天者", [4] = "六十六天" },
+    ko   = { [1] = "입진자", [2] = "파국자", [3] = "역천자", [4] = "육십육천" },
+    en   = DIFF_NAMES_EN,
+    fr   = { [1] = "Facile", [2] = "Normal", [3] = "Difficile", [4] = "Cauchemar" },
+    de   = { [1] = "Leicht", [2] = "Normal", [3] = "Schwer", [4] = "Albtraum" },
+    es   = { [1] = "Fácil", [2] = "Normal", [3] = "Difícil", [4] = "Pesadilla" },
+    pt   = { [1] = "Fácil", [2] = "Normal", [3] = "Difícil", [4] = "Pesadelo" },
+    ru   = { [1] = "Легко", [2] = "Нормально", [3] = "Сложно", [4] = "Кошмар" },
+    it   = { [1] = "Facile", [2] = "Normale", [3] = "Difficile", [4] = "Incubo" },
+    th   = { [1] = "ง่าย", [2] = "ปกติ", [3] = "ยาก", [4] = "ฝันร้าย" },
+    vi   = { [1] = "Dễ", [2] = "Thường", [3] = "Khó", [4] = "Ác mộng" },
+}
+
+local DIFF_OVERRIDE = {}
+local diffOverrideLoaded = false
+local DIFF_OVERRIDE_PATH = OUT .. "hud_diffnames.txt"
+
+local function loadDiffOverride()
+    if diffOverrideLoaded then return end
+    diffOverrideLoaded = true
+    local f = io.open(DIFF_OVERRIDE_PATH, "r")
+    if not f then return end
+    local idx = 0
+    for line in f:lines() do
+        local v = string.gsub(line, "^\239\187\191", "")
+        v = string.gsub(v, "^%s+", "")
+        v = string.gsub(v, "%s+$", "")
+        if v ~= "" then
+            idx = idx + 1
+            if idx >= 1 and idx <= 4 then DIFF_OVERRIDE[idx] = v end
+        end
+    end
+    f:close()
+end
+
+local function diffText(code, db, name)
+    loadDiffOverride()
+    if DIFF_OVERRIDE[db] then return DIFF_OVERRIDE[db] end
+    local t = DIFF_BY_LANG[code] or DIFF_BY_LANG.en
+    return t[db] or name
+end
 
 -- HUD copy for every language the game ships. Every set is written to stats.txt
 -- and PBZStatsHUD.exe shows the one matching the language the game runs in.
@@ -1080,8 +1130,6 @@ local function writeStatsTxt()
     local total = S.displayTotal or S.total or 0
     local bossDeaths = S.bossDeaths or 0
     local cyc = (S.cycleCount or 0) + 1
-    local diffZh = DIFF_NAMES[S.diffByte] or S.diffName
-    local diffEn = DIFF_NAMES_EN[S.diffByte] or S.diffName
     local lang = S.lang
     if lang == nil or lang == "" then lang = LANG_FALLBACK end
     local f = io.open(STATS_TXT, "w")
@@ -1094,10 +1142,9 @@ local function writeStatsTxt()
     for _, code in ipairs(LANG_ORDER) do
         local t = L10N[code]
         if t and CYCLE_FMT[code] then
-            local isZh = (code == "zh" or code == "zht")
             local lines = {
                 "row_" .. code .. "|" .. t.cycle .. "|" .. cleanPipe(CYCLE_FMT[code](cyc)),
-                "row_" .. code .. "|" .. t.diff .. "|" .. cleanPipe(isZh and diffZh or diffEn),
+                "row_" .. code .. "|" .. t.diff .. "|" .. cleanPipe(diffText(code, S.diffByte, S.diffName)),
                 "row_" .. code .. "|" .. t.total .. "|" .. cleanPipe(total),
                 "row_" .. code .. "|" .. t.boss .. "|" .. cleanPipe(bossNameFor(code)),
                 "row_" .. code .. "|" .. t.bossdeaths .. "|" .. cleanPipe(bossDeaths),
@@ -1297,7 +1344,8 @@ local function readGameValues(game)
     end
 end
 
-tick = function()
+
+local function tickBody()
     if S.stopped then return end
 
     if not pollCommand() then return end
@@ -1361,7 +1409,18 @@ tick = function()
 
     if bossCountsDirty then saveBossCounts() end
     writeStats(false)
+end
 
+-- The poll body is wrapped in pcall and the next run is scheduled no matter what:
+-- any unguarded line inside the body used to kill the whole poll loop (the game
+-- simply stopped updating stats.txt). Errors are logged once per session.
+tick = function()
+    local ok, err = pcall(tickBody)
+    if not ok and not S.tickErrLogged then
+        S.tickErrLogged = true
+        log("tick error: " .. tostring(err))
+    end
+    if S.stopped then return end
     safe(function() return ExecuteInGameThreadWithDelay(POLL_MS, tick) end, nil)
 end
 
@@ -1410,7 +1469,52 @@ local function startHud()
 end
 
 -- ---------------------------------------------------------------------------
--- boot
+-- HUD backend. The visible overlay is a separate process: the PowerShell host
+-- (default, no exe on disk) or the optional compiled exe. Lua only writes
+-- stats.txt - the overlay watches that file.
+-- hud_mode in PBZStatsHUD.ini: ps (default) | exe | both | none
+-- ---------------------------------------------------------------------------
+local HUDCFG = { mode = "ps" }
+local HUD_PS = HUD_DIR .. "run.ps1"
+local HUD_CS = HUD_DIR .. "PBZStatsHUD.cs"
+local psStarted = false
+
+local function fileExists(p)
+    local f = io.open(p, "rb")
+    if f then f:close() return true end
+    return false
+end
+
+local function readHudConfig()
+    HUDCFG.mode = "ps"
+    local f = io.open(HUD_DIR .. "PBZStatsHUD.ini", "rb")
+    if not f then return end
+    for line in f:lines() do
+        local m = line:match("^%s*hud_mode%s*=%s*([%w_%-]+)")
+        if m then HUDCFG.mode = string.lower(m) end
+    end
+    f:close()
+    if HUDCFG.mode ~= "ps" and HUDCFG.mode ~= "exe" and HUDCFG.mode ~= "both"
+       and HUDCFG.mode ~= "none" and HUDCFG.mode ~= "umg" then
+        HUDCFG.mode = "ps"
+    end
+    -- "umg" was the old in-engine mode; the in-engine renderer is gone.
+    if HUDCFG.mode == "umg" then HUDCFG.mode = "ps" end
+end
+
+local function startPsHud()
+    if psStarted then return end
+    psStarted = true
+    if not fileExists(HUD_PS) or not fileExists(HUD_CS) then
+        log("HUD: powershell host not installed (" .. tostring(HUD_PS) .. ")")
+        return
+    end
+    local cmd = 'start "" powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "'
+        .. HUD_PS .. '"'
+    local ok = pcall(os.execute, cmd)
+    log("HUD: powershell host start requested ok=" .. tostring(ok))
+end
+
 -- ---------------------------------------------------------------------------
 local function boot()
     log("========== PBZStats boot v" .. MOD_VERSION .. " (lua 8.0) ==========")
@@ -1447,7 +1551,13 @@ local function boot()
     -- out in the wrong language and has to be corrected a second later.
     safe(detectLanguage, S.game)
     writeStats(true)
-    safe(startHud)
+    safe(readHudConfig)
+
+    if HUDCFG.mode == "ps" or HUDCFG.mode == "both" then safe(startPsHud) end
+
+    if HUDCFG.mode == "exe" or HUDCFG.mode == "both" then safe(startHud) end
+
+    if HUDCFG.mode == "none" then log("HUD: disabled by hud_mode=none") end
     safe(function() return ExecuteInGameThreadWithDelay(200, tick) end, nil)
     log("polling started, interval " .. tostring(POLL_MS) .. " ms")
 end

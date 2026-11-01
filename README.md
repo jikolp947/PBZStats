@@ -1,6 +1,6 @@
 # PBZStats — Death Counter HUD for Phantom Blade Zero
 
-Current release: **v3.2.2** — the HUD follows the in-game language live (switching the language in the options menu updates the overlay without a restart), shows its version in the startup notification and tray, and the installer/uninstaller print step-by-step status with a final RESULT line. User documentation: `docs/README.md`.
+Current release: **v3.7.1** — by default the HUD is drawn by a hidden PowerShell host (no `.exe` on disk, so antivirus tools have nothing to quarantine); `hud_mode=exe` still uses the shipped overlay, `none` disables the HUD. User documentation: `docs/README.md`.
 
 A HUD mod for **Phantom Blade Zero** that shows five lines at the right-middle of the screen:
 
@@ -21,6 +21,8 @@ Data is read from the game's own runtime state (including the per-boss records s
 - **13 种语言自动跟随**游戏内语言：切换语言后几秒内自动刷新，无需重启游戏
 - 透明、鼠标穿透、不抢焦点，随游戏启动与退出，无后台进程、无 Python
 - 长 Boss 名自动省略号，不会超出屏幕
+- **默认游戏内绘制（3.6.0）**：五行由 Lua 用 UMG 直接画在游戏里，不再启动 exe，杀软不会再报毒；独立覆盖层仍在，改 `hud_mode=exe` 使用
+- **设置页面**：游戏内按 **Ctrl+F8**（可改）打开，逐行显示/隐藏、调字号、自由拖动 HUD 并保存位置
 - 只读：不修改存档与游戏文件
 
 **安装**：关闭游戏 → 解压 → 右键 `install.ps1` → 用 PowerShell 运行 → 从 Steam 正常启动游戏。

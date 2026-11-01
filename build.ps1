@@ -15,7 +15,7 @@ if (-not (Test-Path $csc)) {
     throw 'csc.exe (.NET Framework 4.x) not found'
 }
 
-& $csc /nologo /target:winexe /platform:anycpu /optimize+ /unsafe `
+& $csc /nologo /target:winexe /platform:anycpu /optimize+ /unsafe /codepage:65001 `
     /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
     "/out:$dist\PBZStatsHUD.exe" (Join-Path $root 'src\PBZStatsHUD.cs')
 

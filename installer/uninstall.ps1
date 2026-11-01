@@ -94,8 +94,28 @@ try {
         Start-Sleep -Milliseconds 400
         if (Get-Process PBZStatsHUD -ErrorAction SilentlyContinue) { Write-Warn 'PBZStatsHUD.exe is still running' }
         else { Write-Ok 'HUD process stopped' }
+    }
+
+    # PowerShell host (no-exe overlay): stop any powershell.exe running our run.ps1
+    $psHost = @()
+    try {
+        # Match only the real launcher form ("-File ...\run.ps1") and never the shell
+        # running this uninstaller: a terminal whose command line merely mentions
+        # run.ps1 (documentation, notes, another script) must not be killed.
+        $psHost = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object {
+                      $_.ProcessId -ne $PID -and
+                      $_.CommandLine -and
+                      $_.CommandLine -match '-File\s+"?[^"]*run\.ps1' -and
+                      $_.CommandLine -notmatch 'install\.ps1|uninstall\.ps1'
+                  }
+    } catch { }
+    if ($psHost) {
+        foreach ($proc in $psHost) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 400
+        Write-Ok ('PowerShell HUD host stopped (' + $psHost.Count + ')')
     } else {
-        Write-Info 'HUD is not running'
+        Write-Info 'PowerShell HUD host is not running'
     }
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $removedKeys = 0
