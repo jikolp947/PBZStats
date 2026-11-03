@@ -1,22 +1,28 @@
 ﻿param(
     [string]$GameDir = '',
     [switch]$NoBackup,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$NoPrompt
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $src  = Join-Path $here 'files'
-$version = '3.7.1'
+$version = '3.8.1'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logPath = Join-Path $env:TEMP ('PBZStats_install_' + $stamp + '.log')
 
 # ---------------------------------------------------------------------------
-# Status helpers: every phase prints [n/total] + OK / WARN / FAIL, and the
-# final block repeats a checklist so the result is obvious even if the window
-# scrolled.  Colours are only cosmetic; the log file keeps the same text.
+# Two package shapes are supported by this single installer:
+#   * lite  - no injector inside: PBZStats only, on top of an existing UE4SS
+#             framework (Nexus "PBZ UE4SS Framework", mod 125).  Nothing binary
+#             is installed, so the mod folder is just Lua + ini + sources.
+#   * full  - ships ue4ss\ + dwmapi.dll (the GitHub build).  Kept for people
+#             who want one download and no dependency.
+# Both print the same [n/total] + OK / WARN / FAIL vocabulary and finish with a
+# checklist, the injector line and a RESULT line with an exit code.
 # ---------------------------------------------------------------------------
 $script:step = 0
-$script:total = 8
+$script:total = 9
 $script:warnings = 0
 $script:failures = 0
 $script:checks = @()
@@ -51,35 +57,119 @@ function Add-Check([string]$name, [bool]$ok, [string]$detail) {
     if ($ok) { Write-Ok ($name + ': ' + $detail) } else { Write-Fail ($name + ': ' + $detail) }
 }
 
+# Join-Path throws when the path names a drive that does not exist on this PC
+# ("Cannot find drive. A drive with the name 'G' does not exist."). The probe
+# below must never throw, otherwise a machine without a G: drive aborts the
+# whole installer at step 1. [IO.Path]::Combine does not touch the file system.
+function Join-SafePath {
+    param([string]$Base, [string]$Child)
+    if (-not $Base) { return '' }
+    try { return [IO.Path]::Combine($Base, $Child) } catch { return '' }
+}
+
+function Test-PathQuiet {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try { return (Test-Path -LiteralPath $Path) } catch { return $false }
+}
+
+# "-GameDir" is typed by hand, so accept every shape a user may paste:
+#   G:\SteamLibrary\steamapps\common\PBZ        <- the folder we want
+#   "G:\...\common\PBZ\"                        <- quotes / trailing slash
+#   G:\\SteamLibrary\\steamapps\\common\\PBZ    <- escaped backslashes from VDF
+#   G:\...\common\PBZ\platform\steam            <- too deep
+#   G:\...\common\PBZ\platform\steam\PBZ.exe    <- the exe itself
+function Resolve-GameDir {
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    $p = $Path.Trim()
+    $p = $p.Trim('"').Trim("'").Trim()
+    if (-not $p) { return '' }
+    $p = $p.Replace('\\', '\')
+    $p = $p.TrimEnd('\')
+    if ($p -match '^[A-Za-z]:$') { return '' }
+    if ($p -match '(?i)\\platform\\steam\\PBZ\.exe$') { $p = $p -replace '(?i)\\platform\\steam\\PBZ\.exe$', '' }
+    elseif ($p -match '(?i)\\platform\\steam$') { $p = $p -replace '(?i)\\platform\\steam$', '' }
+    elseif ($p -match '(?i)\\platform$') { $p = $p -replace '(?i)\\platform$', '' }
+    elseif ($p -match '(?i)\\PBZ\.exe$') { $p = $p -replace '(?i)\\PBZ\.exe$', '' }
+    return $p.TrimEnd('\')
+}
+
 function Find-GameDir {
     $candidates = @()
-    if ($GameDir) { $candidates += $GameDir }
-    $candidates += @(
-        'G:\SteamLibrary\steamapps\common\PBZ',
-        'D:\SteamLibrary\steamapps\common\PBZ',
-        'E:\SteamLibrary\steamapps\common\PBZ',
-        'C:\Program Files (x86)\Steam\steamapps\common\PBZ',
-        'D:\Steam\steamapps\common\PBZ',
-        'C:\Steam\steamapps\common\PBZ'
-    )
+    $explicit = Resolve-GameDir $GameDir
+    if ($explicit) { $candidates += $explicit }
+
+    # 1) every Steam library registered in libraryfolders.vdf
     $steamRoots = @()
     try {
         $steamPath = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
-        if ($steamPath) { $steamRoots += $steamPath }
+        if ($steamPath) { $steamRoots += ($steamPath.Replace('/', '\').TrimEnd('\')) }
     } catch { }
     $steamRoots += @('C:\Program Files (x86)\Steam', 'C:\Steam')
+    $libraries = @()
     foreach ($root in $steamRoots) {
-        $vdf = Join-Path $root 'steamapps\libraryfolders.vdf'
-        if (Test-Path $vdf) {
-            foreach ($line in Get-Content $vdf -ErrorAction SilentlyContinue) {
-                if ($line -match '"path"\s+"([^"]+)"') {
-                    $candidates += (Join-Path $matches[1] 'steamapps\common\PBZ')
+        $vdf = Join-SafePath $root 'steamapps\libraryfolders.vdf'
+        if (-not (Test-PathQuiet $vdf)) { continue }
+        $libraries += $root
+        foreach ($line in Get-Content -LiteralPath $vdf -ErrorAction SilentlyContinue) {
+            if ($line -match '"path"\s+"([^"]+)"') {
+                # VDF stores "D:\\SteamLibrary": undo the escaping and any trailing slash.
+                $lib = $matches[1].Replace('\\', '\').TrimEnd('\')
+                if ($lib) { $libraries += $lib }
+            }
+        }
+    }
+    foreach ($lib in $libraries) {
+        $candidates += (Join-SafePath $lib 'steamapps\common\PBZ')
+        # 3) the appmanifest knows the real folder name, so a renamed folder still works
+        $acf = Join-SafePath $lib 'steamapps\appmanifest_4115450.acf'
+        if (Test-PathQuiet $acf) {
+            foreach ($line in Get-Content -LiteralPath $acf -ErrorAction SilentlyContinue) {
+                if ($line -match '"installdir"\s+"([^"]+)"') {
+                    $candidates += (Join-SafePath $lib ('steamapps\common\' + $matches[1]))
                 }
             }
         }
     }
+
+    # 4) last sweep: the usual folder names on every fixed drive.  Cheap because
+    #    Test-Path on a missing drive simply returns False.
+    $common = @('SteamLibrary', 'Steam', 'Program Files (x86)\Steam', 'Games\SteamLibrary', 'SteamLibrary2')
+    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        if ($d.Name -notmatch '^[A-Za-z]$') { continue }
+        foreach ($c in $common) {
+            $candidates += ('{0}:\{1}\steamapps\common\PBZ' -f $d.Name.ToUpper(), $c)
+        }
+    }
+
     foreach ($c in $candidates) {
-        if ($c -and (Test-Path (Join-Path $c 'platform\steam\PBZ.exe'))) { return $c }
+        if (-not $c) { continue }
+        if (Test-PathQuiet (Join-SafePath $c 'platform\steam\PBZ.exe')) { return $c.TrimEnd('\') }
+    }
+    return ''
+}
+
+# Last resort: ask the user for the folder instead of failing with a cryptic
+# error.  Accepts the folder, the platform folder or the exe; validates before
+# returning.  Returns '' when the user gives up (or when input is redirected).
+function Ask-GameDir {
+    if ($NoPrompt) { return '' }
+    $attempts = 0
+    while ($attempts -lt 3) {
+        Write-Host ''
+        Write-Host 'Phantom Blade Zero was not found automatically.' -ForegroundColor Yellow
+        Write-Host '没找到游戏目录，请把游戏文件夹粘贴到这里。' -ForegroundColor Yellow
+        Write-Host '  example / 例如: G:\SteamLibrary\steamapps\common\PBZ' -ForegroundColor DarkGray
+        Write-Host '  (right-click pastes / 右键粘贴; press Enter with nothing to skip)'
+        $answer = ''
+        try { $answer = Read-Host 'Game folder / 游戏目录' } catch { return '' }
+        if (-not $answer -or -not $answer.Trim()) { return '' }
+        $resolved = Resolve-GameDir $answer
+        if (Test-PathQuiet (Join-SafePath $resolved 'platform\steam\PBZ.exe')) { return $resolved }
+        Write-Host ('  not a game folder: ' + $resolved) -ForegroundColor Red
+        Write-Host '  这个目录里没有 platform\steam\PBZ.exe' -ForegroundColor Red
+        $attempts++
     }
     return ''
 }
@@ -98,22 +188,69 @@ function Wait-IfDoubleClicked {
     } catch { }
 }
 
+# Adds (or repairs) the "PBZStats : 1" line in the framework's mods.txt without
+# touching any other entry.  UE4SS only loads what is listed there, so without
+# this line a lite install would copy the files and still never run.
+function Enable-ModInModsTxt([string]$modsTxt) {
+    $lines = @()
+    if (Test-Path $modsTxt) {
+        $lines = @(Get-Content $modsTxt -Encoding UTF8 -ErrorAction SilentlyContinue)
+    }
+    $found = $false
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        if ($line -match '^\s*PBZStats\s*:') {
+            $out.Add('PBZStats : 1') | Out-Null
+            $found = $true
+        } else {
+            $out.Add($line) | Out-Null
+        }
+    }
+    if (-not $found) {
+        $insertAt = -1
+        for ($i = 0; $i -lt $out.Count; $i++) {
+            if ($out[$i] -match '^\s*;\s*Built-in keybinds') { $insertAt = $i; break }
+        }
+        if ($insertAt -ge 0) {
+            $out.Insert($insertAt, '')
+            $out.Insert($insertAt + 1, 'PBZStats : 1')
+            $out.Insert($insertAt + 2, '')
+        } else {
+            if ($out.Count -gt 0 -and $out[$out.Count - 1].Trim() -ne '') { $out.Add('') | Out-Null }
+            $out.Add('PBZStats : 1') | Out-Null
+        }
+    }
+    [IO.File]::WriteAllText($modsTxt, ($out -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    return $found
+}
+
 $transcript = $false
 try { Start-Transcript -Path $logPath -Force | Out-Null; $transcript = $true } catch { }
 
 try {
-    Write-Head ("PBZ Stats HUD v{0} - installer / 安装程序" -f $version)
+    $isFull = Test-Path (Join-Path $src 'ue4ss\UE4SS.dll')
+    $shape = if ($isFull) { 'full' } else { 'lite' }
+
+    Write-Head ("PBZ Stats HUD v{0} - installer / 安装程序 ({1})" -f $version, $shape)
     Write-Host ('log file : ' + $logPath) -ForegroundColor DarkGray
+    if (-not $isFull) {
+        Write-Host 'lite package: PBZStats only, it uses an already installed UE4SS framework.' -ForegroundColor DarkGray
+        Write-Host '轻量包：本包不含注入器，需要先安装 UE4SS 框架（Nexus mod 125）。' -ForegroundColor DarkGray
+    }
 
     # --- 1) locate the game -------------------------------------------------
     Write-Step 'Locating Phantom Blade Zero / 查找游戏目录'
     $game = Find-GameDir
     if (-not $game) {
+        Write-Info 'automatic detection failed / 自动查找失败，改为手动输入'
+        $game = Ask-GameDir
+    }
+    if (-not $game) {
         Write-Host ''
         Write-Host 'RESULT: FAILED - Phantom Blade Zero was not found.' -ForegroundColor Red
-        Write-Host 'Run again with the game folder, for example:' -ForegroundColor Yellow
+        Write-Host 'Run again and paste the game folder when asked, or pass it directly:' -ForegroundColor Yellow
         Write-Host '  .\install.ps1 -GameDir "G:\SteamLibrary\steamapps\common\PBZ"'
-        Write-Host '安装失败：未找到游戏目录。可加 -GameDir 参数指定。'
+        Write-Host '安装失败：未找到游戏目录。重新运行并粘贴游戏文件夹，或加 -GameDir 参数。'
         exit 1
     }
     $game = $game.TrimEnd('\')
@@ -135,12 +272,77 @@ try {
 
     $modDir = Join-Path $plat 'ue4ss\Mods\PBZStats'
     $marker = Join-Path $plat '.pbzstats_version'
+    $modsTxt = Join-Path $plat 'ue4ss\Mods\mods.txt'
     $isOurs = Test-Path $marker
     Write-Info ("mod dir  : " + $modDir)
     if ($isOurs) { Write-Info 'previous PBZStats install detected / 检测到旧版本，将直接升级' }
 
-    # --- 2) preserve data, prepare the target ------------------------------
-    Write-Step 'Preparing target folder / 准备安装目录'
+    # --- 2) framework check (lite) / target preparation (full) -------------
+    if (-not $isFull) {
+        Write-Step 'Checking the UE4SS framework / 检查 UE4SS 框架'
+        $fwDll = Join-Path $plat 'ue4ss\UE4SS.dll'
+        $fwLoader = Join-Path $plat 'dwmapi.dll'
+        $fwMods = Join-Path $plat 'ue4ss\Mods'
+        $fwOk = (Test-Path $fwDll) -and (Test-Path $fwMods)
+        if (-not $fwOk) {
+            Write-Host ''
+            Write-Host 'RESULT: FAILED - the UE4SS framework is not installed in this game folder.' -ForegroundColor Red
+            Write-Host ''
+            Write-Host '安装失败：这个游戏目录里没有 UE4SS 框架。本轻量包必须依赖它。'
+            Write-Host ''
+            Write-Host 'How to fix / 怎么解决（1 分钟）:' -ForegroundColor Yellow
+            Write-Host '  1. Install the framework first (free, Nexus, virus scan: safe to use):'
+            Write-Host '     https://www.nexusmods.com/phantombladezero/mods/125'
+            Write-Host '     (PBZ UE4SS Framework - run its installMOD.exe and point it at Steam)'
+            Write-Host '  2. Start the game once so the framework launches, then close it.'
+            Write-Host '  3. Run this installer again.'
+            Write-Host ''
+            Write-Host ('expected files: ' + $fwDll)
+            Write-Host ('                ' + $fwMods)
+            exit 2
+        }
+        Add-Check 'UE4SS framework' $true ('{0:N0} bytes' -f (Get-Item $fwDll).Length)
+        if (Test-Path $fwLoader) {
+            Write-Ok ('dwmapi.dll loader: {0:N0} bytes' -f (Get-Item $fwLoader).Length)
+        } else {
+            Write-Warn 'dwmapi.dll not found - the framework may not start (Nexus mod 125 installs it)'
+        }
+        Write-Info 'the framework is left untouched; only ue4ss\Mods\PBZStats is replaced'
+    } else {
+        Write-Step 'Preparing target folder / 准备安装目录'
+        if ($isOurs) {
+            Get-ChildItem $plat -Directory -Filter 'ue4ss_backup_*' -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Ok 'old backup files cleared (in-place update)'
+        } elseif ($NoBackup) {
+            Write-Warn 'NoBackup given: existing ue4ss / dwmapi.dll will NOT be backed up'
+        } else {
+            if (Test-Path (Join-Path $plat 'ue4ss')) {
+                $bak = Join-Path $plat ('ue4ss_backup_' + $stamp)
+                Move-Item (Join-Path $plat 'ue4ss') $bak
+                Write-Ok ("other ue4ss install backed up to " + $bak)
+            }
+            if (Test-Path (Join-Path $plat 'dwmapi.dll')) {
+                $dllBak = 'dwmapi.dll.bak_' + $stamp
+                Rename-Item (Join-Path $plat 'dwmapi.dll') $dllBak
+                Write-Ok ("other dwmapi.dll backed up as " + $dllBak)
+            }
+            Get-ChildItem $plat -Directory -Filter 'ue4ss_backup_*' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path (Join-Path $plat 'ue4ss')) -and -not (Test-Path (Join-Path $plat 'dwmapi.dll'))) {
+                Write-Info 'no other UE4SS install present - clean install'
+            }
+        }
+    }
+
+    # --- 3) preserve data, then copy the mod -------------------------------
+    Write-Step 'Copying mod files / 复制 mod 文件'
     $savedData = ''
     $dataDirOld = Join-Path $modDir 'data'
     if (Test-Path $dataDirOld) {
@@ -151,53 +353,31 @@ try {
     } else {
         Write-Info 'no existing data folder, nothing to migrate'
     }
-    if ($isOurs) {
-        Get-ChildItem $plat -Directory -Filter 'ue4ss_backup_*' -ErrorAction SilentlyContinue |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $plat 'ue4ss') -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $plat 'dwmapi.dll') -Force -ErrorAction SilentlyContinue
-        Write-Ok 'old mod files cleared (in-place update, no backup needed)'
-    } elseif ($NoBackup) {
-        Write-Warn 'NoBackup given: existing ue4ss / dwmapi.dll will NOT be backed up'
-        Remove-Item (Join-Path $plat 'ue4ss') -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $plat 'dwmapi.dll') -Force -ErrorAction SilentlyContinue
-    } else {
-        if (Test-Path (Join-Path $plat 'ue4ss')) {
-            $bak = Join-Path $plat ('ue4ss_backup_' + $stamp)
-            Move-Item (Join-Path $plat 'ue4ss') $bak
-            Write-Ok ("other ue4ss install backed up to " + $bak)
-        }
-        if (Test-Path (Join-Path $plat 'dwmapi.dll')) {
-            $dllBak = 'dwmapi.dll.bak_' + $stamp
-            Rename-Item (Join-Path $plat 'dwmapi.dll') $dllBak
-            Write-Ok ("other dwmapi.dll backed up as " + $dllBak)
-        }
-        Get-ChildItem $plat -Directory -Filter 'ue4ss_backup_*' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path (Join-Path $plat 'ue4ss')) -and -not (Test-Path (Join-Path $plat 'dwmapi.dll'))) {
-            Write-Info 'no other UE4SS install present - clean install'
-        }
-    }
-
-    # --- 3) copy injector + Lua mod ---------------------------------------
-    Write-Step 'Copying UE4SS injector and mod files / 复制注入器与脚本'
     try {
-        Copy-Item (Join-Path $src 'dwmapi.dll') $plat -Force
-        Copy-Item (Join-Path $src 'ue4ss') $plat -Recurse -Force
-        $dllDst = Join-Path $plat 'dwmapi.dll'
-        $ue4ssDll = Join-Path $plat 'ue4ss\UE4SS.dll'
-        if ((Test-Path $dllDst) -and (Test-Path $ue4ssDll)) {
-            $dllMb = [math]::Round((Get-Item $dllDst).Length / 1MB, 1)
-            $ue4ssMb = [math]::Round(((Get-ChildItem (Join-Path $plat 'ue4ss') -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
-            Write-Ok ("dwmapi.dll ({0} MB) + ue4ss\ ({1} MB)" -f $dllMb, $ue4ssMb)
+        if ($isFull) {
+            Copy-Item (Join-Path $src 'dwmapi.dll') $plat -Force
+            if (Test-Path (Join-Path $plat 'ue4ss')) { Remove-Item (Join-Path $plat 'ue4ss') -Recurse -Force -ErrorAction SilentlyContinue }
+            Copy-Item (Join-Path $src 'ue4ss') $plat -Recurse -Force
+            $dllDst = Join-Path $plat 'dwmapi.dll'
+            $ue4ssDll = Join-Path $plat 'ue4ss\UE4SS.dll'
+            if ((Test-Path $dllDst) -and (Test-Path $ue4ssDll)) {
+                $dllMb = [math]::Round((Get-Item $dllDst).Length / 1MB, 1)
+                $ue4ssMb = [math]::Round(((Get-ChildItem (Join-Path $plat 'ue4ss') -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
+                Write-Ok ("dwmapi.dll ({0} MB) + ue4ss\ ({1} MB)" -f $dllMb, $ue4ssMb)
+            } else {
+                Write-Fail 'injector files are missing after the copy'
+            }
         } else {
-            Write-Fail 'injector files are missing after the copy'
+            if (Test-Path $modDir) { Remove-Item $modDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Copy-Item (Join-Path $src 'ue4ss\Mods\PBZStats') (Split-Path $modDir -Parent) -Recurse -Force
+            $luaSrc = Join-Path $modDir 'Scripts\main.lua'
+            if (Test-Path $luaSrc) {
+                Write-Ok ('ue4ss\Mods\PBZStats ({0} files, {1:N0} bytes)' -f `
+                    (Get-ChildItem $modDir -Recurse -File).Count, `
+                    (Get-ChildItem $modDir -Recurse -File | Measure-Object Length -Sum).Sum)
+            } else {
+                Write-Fail 'mod files are missing after the copy'
+            }
         }
     } catch {
         Write-Fail ('copy failed: ' + $_.Exception.Message)
@@ -206,8 +386,8 @@ try {
     # --- 4) marker --------------------------------------------------------
     Write-Step 'Writing install marker / 写入安装标记'
     try {
-        Set-Content -Path $marker -Value ('PBZStats HUD ' + $version) -Encoding ASCII
-        if (Test-Path $marker) { Write-Ok ('.pbzstats_version = PBZStats HUD ' + $version) }
+        Set-Content -Path $marker -Value ('PBZStats HUD ' + $version + ' (' + $shape + ')') -Encoding ASCII
+        if (Test-Path $marker) { Write-Ok ('.pbzstats_version = PBZStats HUD ' + $version + ' (' + $shape + ')') }
         else { Write-Fail 'marker file was not written' }
     } catch {
         Write-Fail ('marker write failed: ' + $_.Exception.Message)
@@ -247,8 +427,6 @@ try {
     Write-Step 'Installing HUD executable / 安装 HUD 程序'
     $hudDst = Join-Path $modDir 'PBZStatsHUD.exe'
     $hudBak = Join-Path $modDir 'hudbox.dat'
-    # Some packages (the Nexus download) intentionally ship without the optional
-    # overlay exe: the PowerShell host draws the HUD, so nothing has to be copied.
     $packHasExe = (Test-Path (Join-Path $here 'PBZStatsHUD.exe')) -or (Test-Path (Join-Path $here 'hudbox.dat'))
     try {
         if (Test-Path (Join-Path $here 'PBZStatsHUD.exe')) {
@@ -274,7 +452,35 @@ try {
         Write-Fail ('HUD copy failed: ' + $_.Exception.Message)
     }
 
-    # --- 7) remove leftovers from the old autostart releases ---------------
+    # --- 7) register the mod in the framework's mods.txt (lite) ------------
+    if (-not $isFull) {
+        Write-Step 'Registering PBZStats in mods.txt / 在 mods.txt 里启用'
+        try {
+            if (-not (Test-Path (Split-Path $modsTxt -Parent))) {
+                New-Item -ItemType Directory -Path (Split-Path $modsTxt -Parent) -Force | Out-Null
+            }
+            $repaired = Enable-ModInModsTxt $modsTxt
+            if (Test-Path $modsTxt) {
+                $line = Select-String -Path $modsTxt -Pattern '^\s*PBZStats\s*:\s*1' | Select-Object -First 1
+                if ($line) {
+                    if ($repaired) { Write-Ok 'PBZStats : 1 (already listed, kept enabled)' }
+                    else { Write-Ok 'PBZStats : 1 added to ue4ss\Mods\mods.txt' }
+                    Write-Info 'other mods.txt entries were left exactly as they were'
+                } else {
+                    Write-Fail 'mods.txt does not contain PBZStats : 1'
+                }
+            } else {
+                Write-Fail 'mods.txt could not be written'
+            }
+        } catch {
+            Write-Fail ('mods.txt update failed: ' + $_.Exception.Message)
+        }
+    } else {
+        Write-Step 'Registering PBZStats in mods.txt / 在 mods.txt 里启用'
+        Write-Ok 'shipped inside the package (ue4ss\Mods\mods.txt)'
+    }
+
+    # --- 8) remove leftovers from the old autostart releases ---------------
     Write-Step 'Cleaning legacy autostart entries / 清理旧版自启动项'
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $cleaned = 0
@@ -292,34 +498,36 @@ try {
     if ($cleaned -gt 0) { Write-Ok ("removed $cleaned autostart entr(y/ies)") }
     else { Write-Info 'nothing to clean (no autostart entries from v1.x/2.x)' }
 
-    # --- 8) verify --------------------------------------------------------
+    # --- 9) verify --------------------------------------------------------
     Write-Step 'Verifying installation / 校验安装结果'
-    $dll = Join-Path $plat 'dwmapi.dll'
-    $ue4ssDll = Join-Path $plat 'ue4ss\UE4SS.dll'
     $luaDst = Join-Path $modDir 'Scripts\main.lua'
 
-    $dllOk = $false; $dllDetail = 'missing'
-    $dllSrc = Join-Path $src 'dwmapi.dll'
-    if (Test-Path $dll) {
-        $dllSize = (Get-Item $dll).Length
-        if (Test-Path $dllSrc) {
-            $srcSize = (Get-Item $dllSrc).Length
-            $dllOk = ($dllSize -eq $srcSize)
-            if ($dllOk) {
-                $dllDetail = ('{0:N0} bytes, matches the bundled injector' -f $dllSize)
+    if ($isFull) {
+        $dll = Join-Path $plat 'dwmapi.dll'
+        $dllOk = $false; $dllDetail = 'missing'
+        $dllSrc = Join-Path $src 'dwmapi.dll'
+        if (Test-Path $dll) {
+            $dllSize = (Get-Item $dll).Length
+            if (Test-Path $dllSrc) {
+                $dllOk = ($dllSize -eq (Get-Item $dllSrc).Length)
+                $dllDetail = if ($dllOk) { ('{0:N0} bytes, matches the bundled injector' -f $dllSize) } else { ('{0:N0} bytes, unexpected size' -f $dllSize) }
             } else {
-                $dllDetail = ('{0:N0} bytes, expected {1:N0}' -f $dllSize, $srcSize)
+                $dllOk = $dllSize -gt 0
+                $dllDetail = ('{0:N0} bytes' -f $dllSize)
             }
-        } else {
-            $dllOk = $dllSize -gt 0
-            $dllDetail = ('{0:N0} bytes' -f $dllSize)
         }
+        Add-Check 'injector dwmapi.dll' $dllOk $dllDetail
+        $ue4ssDll = Join-Path $plat 'ue4ss\UE4SS.dll'
+        Add-Check 'UE4SS.dll' (Test-Path $ue4ssDll) $(if (Test-Path $ue4ssDll) { '{0:N0} bytes' -f (Get-Item $ue4ssDll).Length } else { 'missing' })
+    } else {
+        $fwDll = Join-Path $plat 'ue4ss\UE4SS.dll'
+        Add-Check 'UE4SS framework (external)' (Test-Path $fwDll) $(if (Test-Path $fwDll) { '{0:N0} bytes, not modified by this installer' -f (Get-Item $fwDll).Length } else { 'missing' })
+        $enabled = $false
+        if (Test-Path $modsTxt) {
+            $enabled = [bool](Select-String -Path $modsTxt -Pattern '^\s*PBZStats\s*:\s*1' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        Add-Check 'mods.txt entry' $enabled $(if ($enabled) { 'PBZStats : 1' } else { 'missing in ' + $modsTxt })
     }
-    Add-Check 'injector dwmapi.dll' $dllOk $dllDetail
-
-    $ue4ssOk = Test-Path $ue4ssDll
-    if ($ue4ssOk) { $ue4ssDetail = ('{0:N0} bytes' -f (Get-Item $ue4ssDll).Length) } else { $ue4ssDetail = 'missing' }
-    Add-Check 'UE4SS.dll' $ue4ssOk $ue4ssDetail
 
     $luaOk = $false
     $luaHint = 'missing'
@@ -331,11 +539,9 @@ try {
     }
     Add-Check 'Lua mod main.lua' $luaOk $luaHint
 
-    $markerOk = Test-Path $marker
-    if ($markerOk) { $markerDetail = 'PBZStats HUD ' + $version } else { $markerDetail = 'missing' }
-    Add-Check 'install marker' $markerOk $markerDetail
-
+    Add-Check 'install marker' (Test-Path $marker) ('PBZStats HUD ' + $version + ' (' + $shape + ')')
     Add-Check 'data folder' (Test-Path $dataDir) $dataDir
+
     if (Test-Path $hudDst) {
         Add-Check 'HUD exe' $true ('{0:N0} bytes' -f (Get-Item $hudDst).Length)
     } elseif (-not $packHasExe) {
@@ -361,7 +567,9 @@ try {
         Write-Host ('  {0} {1} - {2}' -f $mark, $c.Name, $c.Detail) -ForegroundColor $(if ($c.Ok) { 'Green' } else { 'Red' })
     }
     Write-Host ''
-    Write-Host ('  injector : ' + $dll)
+    Write-Host ('  package  : ' + $shape + ' (PBZStats HUD ' + $version + ')')
+    if ($isFull) { Write-Host ('  injector : ' + (Join-Path $plat 'dwmapi.dll')) }
+    else { Write-Host ('  framework: ' + (Join-Path $plat 'ue4ss') + ' (installed separately, untouched)') }
     Write-Host ('  script   : ' + $luaDst)
     if ($hudMode -eq 'exe') { Write-Host ('  HUD      : ' + $hudDst + ' (started by the game)') }
     elseif (Test-Path $hudDst) { Write-Host ('  HUD      : ' + $hudDst + ' (optional; PowerShell host is used by default)') }
@@ -384,6 +592,10 @@ try {
     } else {
         Write-Host 'Start the game from Steam. The HUD is drawn by a PowerShell host that the mod starts for you - no exe, nothing to run manually.'
         Write-Host '启动游戏后右侧会出现数据 HUD（PowerShell 宿主，无需 exe、无需额外操作），退出游戏后自动关闭。'
+    }
+    if (-not $isFull) {
+        Write-Host 'The UE4SS framework was installed by you and is left untouched; this mod only adds ue4ss\Mods\PBZStats.'
+        Write-Host 'UE4SS 框架是你自己装的，本 mod 只新增 ue4ss\Mods\PBZStats 并在 mods.txt 里启用它。'
     }
     Write-Host 'No Python, no autostart entry, no background watcher is installed.'
     Write-Host 'HUD language follows the game language automatically (edit lang= in PBZStatsHUD.ini to force one).'

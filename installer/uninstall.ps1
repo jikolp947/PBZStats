@@ -1,7 +1,8 @@
 ﻿param(
     [string]$GameDir = '',
     [switch]$KeepData,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$NoPrompt
 )
 $ErrorActionPreference = 'Continue'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -10,6 +11,14 @@ $logPath = Join-Path $env:TEMP ('PBZStats_uninstall_' + $stamp + '.log')
 # ---------------------------------------------------------------------------
 # Same status vocabulary as install.ps1: [n/total] steps, OK/WARN/FAIL lines
 # and a final checklist, so it is obvious whether the mod is really gone.
+#
+# The installer writes "(lite)" or "(full)" into .pbzstats_version, and the
+# uninstaller follows it:
+#   lite -> only ue4ss\Mods\PBZStats + the mods.txt line are removed; the UE4SS
+#           framework belongs to the user and is never touched.
+#   full -> the injector files this mod installed are removed again (ue4ss kept
+#           when other mods live there, dwmapi.dll restored from its backup).
+# A missing marker is treated conservatively: the framework stays.
 # ---------------------------------------------------------------------------
 $script:step = 0
 $script:total = 8
@@ -37,32 +46,112 @@ function Add-Check([string]$name, [bool]$ok, [string]$detail) {
     if ($ok) { Write-Ok ($name + ': ' + $detail) } else { Write-Fail ($name + ': ' + $detail) }
 }
 
+# Join-Path throws when the path names a drive that does not exist on this PC
+# ("Cannot find drive. A drive with the name 'G' does not exist."). The probe
+# must never throw, otherwise a machine without a G: drive aborts the script.
+function Join-SafePath {
+    param([string]$Base, [string]$Child)
+    if (-not $Base) { return '' }
+    try { return [IO.Path]::Combine($Base, $Child) } catch { return '' }
+}
+
+function Test-PathQuiet {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try { return (Test-Path -LiteralPath $Path) } catch { return $false }
+}
+
+# "-GameDir" is typed by hand, so accept every shape a user may paste (see the
+# same helper in install.ps1).
+function Resolve-GameDir {
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    $p = $Path.Trim()
+    $p = $p.Trim('"').Trim("'").Trim()
+    if (-not $p) { return '' }
+    $p = $p.Replace('\\', '\')
+    $p = $p.TrimEnd('\')
+    if ($p -match '^[A-Za-z]:$') { return '' }
+    if ($p -match '(?i)\\platform\\steam\\PBZ\.exe$') { $p = $p -replace '(?i)\\platform\\steam\\PBZ\.exe$', '' }
+    elseif ($p -match '(?i)\\platform\\steam$') { $p = $p -replace '(?i)\\platform\\steam$', '' }
+    elseif ($p -match '(?i)\\platform$') { $p = $p -replace '(?i)\\platform$', '' }
+    elseif ($p -match '(?i)\\PBZ\.exe$') { $p = $p -replace '(?i)\\PBZ\.exe$', '' }
+    return $p.TrimEnd('\')
+}
+
 function Find-GameDir {
     $candidates = @()
-    if ($GameDir) { $candidates += $GameDir }
-    $candidates += @(
-        'G:\SteamLibrary\steamapps\common\PBZ',
-        'D:\SteamLibrary\steamapps\common\PBZ',
-        'E:\SteamLibrary\steamapps\common\PBZ',
-        'C:\Program Files (x86)\Steam\steamapps\common\PBZ',
-        'D:\Steam\steamapps\common\PBZ',
-        'C:\Steam\steamapps\common\PBZ'
-    )
+    $explicit = Resolve-GameDir $GameDir
+    if ($explicit) { $candidates += $explicit }
+
+    # 1) every Steam library registered in libraryfolders.vdf
+    $steamRoots = @()
     try {
         $steamPath = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
-        if ($steamPath) {
-            $vdf = Join-Path $steamPath 'steamapps\libraryfolders.vdf'
-            if (Test-Path $vdf) {
-                foreach ($line in Get-Content $vdf -ErrorAction SilentlyContinue) {
-                    if ($line -match '"path"\s+"([^"]+)"') {
-                        $candidates += (Join-Path $matches[1] 'steamapps\common\PBZ')
-                    }
+        if ($steamPath) { $steamRoots += ($steamPath.Replace('/', '\').TrimEnd('\')) }
+    } catch { }
+    $steamRoots += @('C:\Program Files (x86)\Steam', 'C:\Steam')
+    $libraries = @()
+    foreach ($root in $steamRoots) {
+        $vdf = Join-SafePath $root 'steamapps\libraryfolders.vdf'
+        if (-not (Test-PathQuiet $vdf)) { continue }
+        $libraries += $root
+        foreach ($line in Get-Content -LiteralPath $vdf -ErrorAction SilentlyContinue) {
+            if ($line -match '"path"\s+"([^"]+)"') {
+                # VDF stores "D:\\SteamLibrary": undo the escaping and any trailing slash.
+                $lib = $matches[1].Replace('\\', '\').TrimEnd('\')
+                if ($lib) { $libraries += $lib }
+            }
+        }
+    }
+    foreach ($lib in $libraries) {
+        $candidates += (Join-SafePath $lib 'steamapps\common\PBZ')
+        # 2) the appmanifest knows the real folder name
+        $acf = Join-SafePath $lib 'steamapps\appmanifest_4115450.acf'
+        if (Test-PathQuiet $acf) {
+            foreach ($line in Get-Content -LiteralPath $acf -ErrorAction SilentlyContinue) {
+                if ($line -match '"installdir"\s+"([^"]+)"') {
+                    $candidates += (Join-SafePath $lib ('steamapps\common\' + $matches[1]))
                 }
             }
         }
-    } catch { }
+    }
+
+    # 3) last sweep: the usual folder names on every fixed drive
+    $common = @('SteamLibrary', 'Steam', 'Program Files (x86)\Steam', 'Games\SteamLibrary', 'SteamLibrary2')
+    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        if ($d.Name -notmatch '^[A-Za-z]$') { continue }
+        foreach ($c in $common) {
+            $candidates += ('{0}:\{1}\steamapps\common\PBZ' -f $d.Name.ToUpper(), $c)
+        }
+    }
+
     foreach ($c in $candidates) {
-        if ($c -and (Test-Path (Join-Path $c 'platform\steam\PBZ.exe'))) { return $c }
+        if (-not $c) { continue }
+        if (Test-PathQuiet (Join-SafePath $c 'platform\steam\PBZ.exe')) { return $c.TrimEnd('\') }
+    }
+    return ''
+}
+
+# Ask instead of failing with a cryptic error (the mod may already be gone, so
+# this only runs when nothing was detected).
+function Ask-GameDir {
+    if ($NoPrompt) { return '' }
+    $attempts = 0
+    while ($attempts -lt 3) {
+        Write-Host ''
+        Write-Host 'Phantom Blade Zero was not found automatically.' -ForegroundColor Yellow
+        Write-Host '没找到游戏目录，请把游戏文件夹粘贴到这里。' -ForegroundColor Yellow
+        Write-Host '  example / 例如: G:\SteamLibrary\steamapps\common\PBZ' -ForegroundColor DarkGray
+        Write-Host '  (right-click pastes / 右键粘贴; press Enter with nothing to skip)'
+        $answer = ''
+        try { $answer = Read-Host 'Game folder / 游戏目录' } catch { return '' }
+        if (-not $answer -or -not $answer.Trim()) { return '' }
+        $resolved = Resolve-GameDir $answer
+        if (Test-PathQuiet (Join-SafePath $resolved 'platform\steam\PBZ.exe')) { return $resolved }
+        Write-Host ('  not a game folder: ' + $resolved) -ForegroundColor Red
+        Write-Host '  这个目录里没有 platform\steam\PBZ.exe' -ForegroundColor Red
+        $attempts++
     }
     return ''
 }
@@ -77,6 +166,23 @@ function Wait-IfDoubleClicked {
             Read-Host 'Press Enter to close this window'
         }
     } catch { }
+}
+
+# Removes the "PBZStats : ..." line from the framework's mods.txt and leaves
+# every other line byte-for-byte alone (including comments and blank lines).
+function Disable-ModInModsTxt([string]$modsTxt) {
+    if (-not (Test-Path $modsTxt)) { return $false }
+    $lines = @(Get-Content $modsTxt -Encoding UTF8 -ErrorAction SilentlyContinue)
+    $kept = New-Object System.Collections.Generic.List[string]
+    $removed = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*PBZStats\s*:') { $removed = $true }
+        else { $kept.Add($line) | Out-Null }
+    }
+    if ($removed) {
+        [IO.File]::WriteAllText($modsTxt, ($kept -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return $removed
 }
 
 $transcript = $false
@@ -139,8 +245,17 @@ try {
         $modDir = Join-Path $plat 'ue4ss\Mods\PBZStats'
         Write-Ok ('game folder: ' + $game)
     } else {
-        Write-Warn 'game folder not found - only leftover data will be cleaned'
-        Write-Warn '未找到游戏目录：只清理残留数据。可用 -GameDir 参数指定。'
+        Write-Info 'automatic detection failed / 自动查找失败，改为手动输入'
+        $game = Ask-GameDir
+        if ($game) {
+            $game = $game.TrimEnd('\')
+            $plat = Join-Path $game 'platform\steam'
+            $modDir = Join-Path $plat 'ue4ss\Mods\PBZStats'
+            Write-Ok ('game folder: ' + $game)
+        } else {
+            Write-Warn 'game folder not found - only leftover data will be cleaned'
+            Write-Warn '未找到游戏目录：只清理残留数据。可重新运行并粘贴路径，或加 -GameDir 参数。'
+        }
     }
 
     $gameRunning = $false
@@ -151,17 +266,28 @@ try {
     }
 
     $modDirExisted = $false
-    $ue4ssExisted = $false
     $markerExisted = $false
     $dwmapiExisted = $false
     $dwmapiRestored = $false
     $ue4ssKept = $false
+    $wasLite = $false
+    $markerKind = 'unknown'
 
     if ($plat -and (Test-Path $plat)) {
         $modDirExisted = Test-Path $modDir
-        $ue4ssExisted = Test-Path (Join-Path $plat 'ue4ss')
-        $markerExisted = Test-Path (Join-Path $plat '.pbzstats_version')
+        $marker = Join-Path $plat '.pbzstats_version'
+        $markerExisted = Test-Path $marker
         $dwmapiExisted = Test-Path (Join-Path $plat 'dwmapi.dll')
+        if ($markerExisted) {
+            $markerText = (Get-Content $marker -Raw -ErrorAction SilentlyContinue)
+            $wasLite = ($markerText -match '\(lite\)')
+            if ($markerText -match '\(lite\)') { $markerKind = 'lite' }
+            elseif ($markerText -match '\(full\)') { $markerKind = 'full' }
+            Write-Info ('previous install: ' + $markerText.Trim())
+        } else {
+            $markerKind = 'unknown (no marker: the UE4SS framework is kept)'
+            Write-Info $markerKind
+        }
 
         # --- 3) optional statistics backup --------------------------------
         Write-Step 'Statistics backup / 统计数据备份'
@@ -202,31 +328,74 @@ try {
             Write-Info 'ue4ss\Mods\PBZStats does not exist'
         }
 
-        # --- 5) ue4ss folder (only when no other mods) --------------------
-        Write-Step 'Removing UE4SS injector / 删除 UE4SS 注入器'
-        $ue = Join-Path $plat 'ue4ss'
-        if (Test-Path $ue) {
-            $builtin = @('shared', 'BPML_GenericFunctions', 'BPModLoaderMod',
-                'CheatManagerEnablerMod', 'ConsoleCommandsMod', 'ConsoleEnablerMod',
-                'Keybinds', 'LineTraceMod', 'SplitScreenMod')
-            $other = Get-ChildItem (Join-Path $ue 'Mods') -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne 'PBZStats' -and $_.Name -notin $builtin }
-            if ($other) {
-                $ue4ssKept = $true
-                Write-Warn ('kept ue4ss folder - other mods are installed: ' + (($other | ForEach-Object { $_.Name }) -join ', '))
-                Write-Info '删除后会破坏其它 UE4SS mod，因此保留 ue4ss 目录'
+        # --- 5) framework / injector --------------------------------------
+        Write-Step 'Cleaning the injector / 清理注入器'
+        $modsTxt = Join-Path $plat 'ue4ss\Mods\mods.txt'
+        $lineRemoved = $false
+        try { $lineRemoved = Disable-ModInModsTxt $modsTxt } catch { }
+        if ($lineRemoved) { Write-Ok 'removed the PBZStats line from ue4ss\Mods\mods.txt' }
+        else { Write-Info 'mods.txt had no PBZStats line' }
+
+        if ($wasLite -or $markerKind -like 'unknown*') {
+            $ue4ssKept = $true
+            if ($wasLite) {
+                Write-Ok 'UE4SS framework kept (lite install: it was installed by you, not by this mod)'
+                Write-Info 'UE4SS 框架保留：轻量包从未安装它，卸载也不动它'
             } else {
-                Remove-Item $ue -Recurse -Force -ErrorAction SilentlyContinue
-                if (Test-Path $ue) { Write-Fail 'could not delete the ue4ss folder' }
-                else { Write-Ok 'removed ue4ss folder (no other mods found)' }
+                Write-Info 'no install marker: keeping ue4ss\ and dwmapi.dll untouched'
+                Write-Info '没有安装标记：保留 ue4ss\ 与 dwmapi.dll 不动'
             }
         } else {
-            Write-Info 'ue4ss folder does not exist'
+            $ue = Join-Path $plat 'ue4ss'
+            if (Test-Path $ue) {
+                $builtin = @('shared', 'BPML_GenericFunctions', 'BPModLoaderMod',
+                    'CheatManagerEnablerMod', 'ConsoleCommandsMod', 'ConsoleEnablerMod',
+                    'Keybinds', 'LineTraceMod', 'SplitScreenMod')
+                $other = Get-ChildItem (Join-Path $ue 'Mods') -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -ne 'PBZStats' -and $_.Name -notin $builtin }
+                if ($other) {
+                    $ue4ssKept = $true
+                    Write-Warn ('kept ue4ss folder - other mods are installed: ' + (($other | ForEach-Object { $_.Name }) -join ', '))
+                    Write-Info '删除后会破坏其它 UE4SS mod，因此保留 ue4ss 目录'
+                } else {
+                    Remove-Item $ue -Recurse -Force -ErrorAction SilentlyContinue
+                    if (Test-Path $ue) { Write-Fail 'could not delete the ue4ss folder' }
+                    else { Write-Ok 'removed ue4ss folder (no other mods found)' }
+                }
+            } else {
+                Write-Info 'ue4ss folder does not exist'
+            }
+
+            # restore the original dwmapi.dll this mod replaced (full installs only)
+            $dll = Join-Path $plat 'dwmapi.dll'
+            if (Test-Path $dll) {
+                $bak = Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if (-not $ue4ssKept) {
+                    Remove-Item $dll -Force -ErrorAction SilentlyContinue
+                    if (Test-Path $dll) {
+                        Write-Fail 'could not delete dwmapi.dll (game still running?)'
+                    } elseif ($bak) {
+                        try {
+                            Rename-Item $bak.FullName (Join-Path $plat 'dwmapi.dll')
+                            $dwmapiRestored = $true
+                            Write-Ok ('original dwmapi.dll restored from ' + $bak.Name)
+                        } catch {
+                            Write-Fail ('could not restore ' + $bak.Name + ': ' + $_.Exception.Message)
+                        }
+                    } else {
+                        Write-Ok 'removed the mod dwmapi.dll (there was no original to restore)'
+                    }
+                } else {
+                    Write-Info 'dwmapi.dll kept together with the ue4ss folder'
+                }
+            } else {
+                Write-Info 'dwmapi.dll not present - already clean'
+            }
         }
 
         # --- 6) marker ----------------------------------------------------
         Write-Step 'Removing install marker / 删除安装标记'
-        $marker = Join-Path $plat '.pbzstats_version'
         if (Test-Path $marker) {
             Remove-Item $marker -Force -ErrorAction SilentlyContinue
             if (Test-Path $marker) { Write-Fail 'could not delete .pbzstats_version' }
@@ -234,41 +403,16 @@ try {
         } else {
             Write-Info '.pbzstats_version does not exist'
         }
-
-        # --- 7) restore the original dwmapi.dll ---------------------------
-        Write-Step 'Restoring original dwmapi.dll / 还原原始 dwmapi.dll'
-        $dll = Join-Path $plat 'dwmapi.dll'
-        if (Test-Path $dll) {
-            $bak = Get-ChildItem $plat -Filter 'dwmapi.dll.bak_*' -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            Remove-Item $dll -Force -ErrorAction SilentlyContinue
-            if (Test-Path $dll) {
-                Write-Fail 'could not delete dwmapi.dll (game still running?)'
-            } elseif ($bak) {
-                try {
-                    Rename-Item $bak.FullName (Join-Path $plat 'dwmapi.dll')
-                    $dwmapiRestored = $true
-                    Write-Ok ('original dwmapi.dll restored from ' + $bak.Name)
-                } catch {
-                    Write-Fail ('could not restore ' + $bak.Name + ': ' + $_.Exception.Message)
-                }
-            } else {
-                Write-Ok 'removed the mod dwmapi.dll (there was no original to restore)'
-            }
-        } else {
-            Write-Info 'dwmapi.dll not present - already clean'
-        }
     } else {
         Write-Step 'Statistics backup / 统计数据备份'
         Write-Step 'Removing mod files / 删除 mod 文件'
-        Write-Step 'Removing UE4SS injector / 删除 UE4SS 注入器'
+        Write-Step 'Cleaning the injector / 清理注入器'
         Write-Step 'Removing install marker / 删除安装标记'
-        Write-Step 'Restoring original dwmapi.dll / 还原原始 dwmapi.dll'
         Write-Info 'skipped - game folder unknown'
     }
 
-    # --- 8) legacy data + verify ------------------------------------------
-    Write-Step 'Cleaning legacy data and verifying / 清理旧数据并校验'
+    # --- 7) legacy data ----------------------------------------------------
+    Write-Step 'Cleaning legacy data / 清理旧数据'
     $legacy = Join-Path $env:LOCALAPPDATA 'PBZStats'
     if ($KeepData) {
         Write-Info ('legacy data kept: ' + $legacy)
@@ -280,24 +424,30 @@ try {
         Write-Info 'no legacy data folder'
     }
 
+    # --- 8) verify ---------------------------------------------------------
+    Write-Step 'Verifying / 校验卸载结果'
     if ($plat -and (Test-Path $plat)) {
-        $modStillThere = Test-Path $modDir
-        Add-Check 'mod folder removed' (-not $modStillThere) $modDir
+        Add-Check 'mod folder removed' (-not (Test-Path $modDir)) $modDir
         Add-Check 'install marker removed' (-not (Test-Path (Join-Path $plat '.pbzstats_version'))) (Join-Path $plat '.pbzstats_version')
-        if ($dwmapiExisted) {
-            $dllNow = Test-Path (Join-Path $plat 'dwmapi.dll')
-            if ($dwmapiRestored) {
-                Add-Check 'dwmapi.dll' $dllNow 'original restored'
-            } else {
-                Add-Check 'dwmapi.dll' (-not $dllNow) 'mod version removed'
-            }
-        } else {
-            Add-Check 'dwmapi.dll' (-not (Test-Path (Join-Path $plat 'dwmapi.dll'))) 'not present (nothing to remove)'
+        $modsTxt = Join-Path $plat 'ue4ss\Mods\mods.txt'
+        if (Test-Path $modsTxt) {
+            $stillListed = [bool](Select-String -Path $modsTxt -Pattern '^\s*PBZStats\s*:' -ErrorAction SilentlyContinue | Select-Object -First 1)
+            Add-Check 'mods.txt cleaned' (-not $stillListed) $(if ($stillListed) { 'PBZStats line still present' } else { 'no PBZStats line left' })
         }
         if ($ue4ssKept) {
-            Write-Host '       INFO  ue4ss folder kept on purpose (other mods)' -ForegroundColor DarkGray
+            if ($wasLite) {
+                Add-Check 'UE4SS framework kept' (Test-Path (Join-Path $plat 'ue4ss\UE4SS.dll')) 'installed by you, untouched'
+                Write-Host '       INFO  the framework is still there on purpose: other UE4SS mods may need it' -ForegroundColor DarkGray
+            } else {
+                Write-Host '       INFO  ue4ss folder kept on purpose (other mods or unknown install)' -ForegroundColor DarkGray
+            }
         } else {
             Add-Check 'ue4ss folder removed' (-not (Test-Path (Join-Path $plat 'ue4ss'))) (Join-Path $plat 'ue4ss')
+            if ($dwmapiExisted) {
+                $dllNow = Test-Path (Join-Path $plat 'dwmapi.dll')
+                if ($dwmapiRestored) { Add-Check 'dwmapi.dll' $dllNow 'original restored' }
+                else { Add-Check 'dwmapi.dll' (-not $dllNow) 'mod version removed' }
+            }
         }
     }
 
@@ -312,6 +462,7 @@ try {
         Write-Host '  no game folder checks were possible' -ForegroundColor Yellow
     }
     Write-Host ''
+    Write-Host ('  previous install : ' + $markerKind)
     Write-Host ('  log : ' + $logPath)
     Write-Host ''
     if ($script:failures -gt 0) {
@@ -330,5 +481,5 @@ try {
     Wait-IfDoubleClicked
     exit 0
 } finally {
-    if ($transcript) { try { Stop-Transcript | Out-Null } catch { } }
+    if ($transcript) { try { Stop-Transcript -Out-Null } catch { } }
 }

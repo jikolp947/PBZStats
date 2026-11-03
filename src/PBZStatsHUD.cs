@@ -53,9 +53,20 @@ namespace PBZStatsHud
         // lines move up instead of leaving a gap.
         public readonly List<int> HiddenRows = new List<int>();
         public bool IsHidden(int index) { return HiddenRows.Contains(index); }
+        // Rows that follow the boss fight instead of being always visible:
+        // they are only drawn while a boss fight is active (stats.json
+        // boss_active). Default: the two boss rows (0-based index 3 and 4).
+        public readonly List<int> AutoRows = new List<int> { 3, 4 };
+        public bool IsAuto(int index) { return AutoRows.Contains(index); }
         // Which screen edge the five lines stick to: "right" (default) or "left".
         // The same margin value is used as the distance from that edge.
         public string Align = "right";
+        // Language used for the desktop side (tray menu, tray tooltip, balloon):
+        // "os" (default) follows the Windows display language, "game" follows the
+        // in-game language like the HUD does, any 2-letter code forces that
+        // language. The settings page always follows the in-game language unless
+        // a code is forced here.
+        public string UiLang = "os";
         // Boss names differ wildly in length between languages; clamp the value
         // column so a long name cannot run off the right edge or push the
         // anchor far from the margin.
@@ -98,12 +109,21 @@ namespace PBZStatsHud
                             case "stale_ms": c.StaleMs = int.Parse(v); break;
                             case "settings_hotkey": c.SettingsHotkey = v; break;
                             case "align": c.Align = (v.ToLowerInvariant() == "left") ? "left" : "right"; break;
+                            case "ui_lang": c.UiLang = v.Trim().ToLowerInvariant(); break;
                             case "hidden_rows":
                                 c.HiddenRows.Clear();
                                 foreach (string part in v.Split(','))
                                 {
                                     int n;
                                     if (int.TryParse(part.Trim(), out n) && n >= 0 && n < 64) c.HiddenRows.Add(n);
+                                }
+                                break;
+                            case "auto_rows":
+                                c.AutoRows.Clear();
+                                foreach (string part in v.Split(','))
+                                {
+                                    int n;
+                                    if (int.TryParse(part.Trim(), out n) && n >= 0 && n < 64) c.AutoRows.Add(n);
                                 }
                                 break;
                         }
@@ -150,6 +170,19 @@ namespace PBZStatsHud
                 hid.Append(c.HiddenRows[i]);
             }
             sb.AppendLine("hidden_rows=" + hid.ToString());
+            sb.AppendLine("# auto_rows: comma separated row indexes shown only while a boss fight is active (0 = first line)");
+            StringBuilder aut = new StringBuilder();
+            for (int i = 0; i < c.AutoRows.Count; i++)
+            {
+                if (i > 0) aut.Append(',');
+                aut.Append(c.AutoRows[i]);
+            }
+            sb.AppendLine("auto_rows=" + aut.ToString());
+            sb.AppendLine("# ui_lang: language of the tray menu, tooltip and balloon -");
+            sb.AppendLine("#   os   = follow the Windows display language (default)");
+            sb.AppendLine("#   game = follow the in-game language (same as the HUD)");
+            sb.AppendLine("#   en/zh/ja/... = force that language");
+            sb.AppendLine("ui_lang=" + c.UiLang);
             sb.AppendLine("# data_dir: empty = the data folder next to this exe (data\\)");
             sb.AppendLine("data_dir=" + c.DataDir);
             sb.AppendLine("# layout, measured from the right edge of the game window");
@@ -287,14 +320,43 @@ namespace PBZStatsHud
         }
         public static string L(string key)
         {
+            return L(key, Program.UiLang());
+        }
+
+        // Same lookup with an explicit language: the tray icon and its balloon
+        // follow ui_lang (Windows language by default), which can differ from the
+        // language the HUD itself uses.
+        public static string L(string key, string lang)
+        {
+            string code = string.IsNullOrEmpty(lang) ? "en" : lang;
             if (key == "fonthint")
             {
                 string hint;
-                if (FontHint.TryGetValue(Program.UiLang(), out hint)) return hint;
+                if (FontHint.TryGetValue(code, out hint)) return hint;
                 return FontHint["en"];
             }
+            if (key == "auto")
+            {
+                string w;
+                if (AutoWord.TryGetValue(code, out w)) return w;
+                return AutoWord["en"];
+            }
+            if (key == "always")
+            {
+                string w;
+                if (AlwaysWord.TryGetValue(code, out w)) return w;
+                return AlwaysWord["en"];
+            }
+            if (key.StartsWith("tray_", StringComparison.Ordinal))
+            {
+                Dictionary<string, string> set;
+                if (!TrayText.TryGetValue(code, out set)) set = TrayText["en"];
+                string s;
+                if (set != null && set.TryGetValue(key, out s)) return s;
+                return TrayText["en"].TryGetValue(key, out s) ? s : key;
+            }
             Dictionary<string, string> d;
-            if (!All.TryGetValue(Program.UiLang(), out d)) d = En;
+            if (!All.TryGetValue(code, out d)) d = En;
             string v;
             if (d != null && d.TryGetValue(key, out v)) return v;
             return En.TryGetValue(key, out v) ? v : key;
@@ -317,6 +379,62 @@ namespace PBZStatsHud
             { "th", "ปรับได้ในโหมดอิสระ" },
             { "vi", "chỉnh ở chế độ tự do" },        };
 
+        // Row visibility mode for the two boss rows: "auto" = only while a boss
+        // fight is running, "always" = keep the line on screen all the time.
+        private static readonly Dictionary<string, string> AutoWord =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "en", "auto" }, { "zh", "自动" }, { "zht", "自動" }, { "ja", "自動" },
+            { "ko", "자동" }, { "ru", "авто" }, { "de", "auto" }, { "fr", "auto" },
+            { "es", "auto" }, { "pt", "auto" }, { "it", "auto" },
+            { "th", "อัตโนมัติ" }, { "vi", "tự động" },
+        };
+
+        private static readonly Dictionary<string, string> AlwaysWord =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "en", "always" }, { "zh", "常显" }, { "zht", "常顯" }, { "ja", "常時表示" },
+            { "ko", "항상" }, { "ru", "всегда" }, { "de", "immer" }, { "fr", "toujours" },
+            { "es", "siempre" }, { "pt", "sempre" }, { "it", "sempre" },
+            { "th", "ตลอด" }, { "vi", "luôn hiện" },
+        };
+
+        // Tray menu / tooltip / balloon text. These follow ui_lang, which is the
+        // Windows display language by default, so the notification the user sees
+        // on the desktop matches the desktop, not the game.
+        private static readonly Dictionary<string, Dictionary<string, string>> TrayText =
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "en", Tray("Settings", "Open data folder", "Quit", "running, showing game data", "waiting for the game") },
+            { "zh", Tray("设置", "打开数据文件夹", "退出", "已启动，正在显示游戏数据", "已启动，等待游戏启动") },
+            { "zht", Tray("設定", "開啟資料夾", "結束", "已啟動，正在顯示遊戲資料", "已啟動，等待遊戲啟動") },
+            { "ja", Tray("設定", "データフォルダーを開く", "終了", "起動しました。ゲームデータを表示中", "起動しました。ゲームの開始を待機中") },
+            { "ko", Tray("설정", "데이터 폴더 열기", "종료", "실행 중, 게임 데이터 표시 중", "실행 중, 게임 시작 대기 중") },
+            { "ru", Tray("Настройки", "Открыть папку данных", "Выход", "запущено, показ данных игры", "запущено, ожидание игры") },
+            { "de", Tray("Einstellungen", "Datenordner öffnen", "Beenden", "läuft, Spieldaten werden angezeigt", "läuft, warte auf das Spiel") },
+            { "fr", Tray("Paramètres", "Ouvrir le dossier des données", "Quitter", "démarré, données du jeu affichées", "démarré, en attente du jeu") },
+            { "es", Tray("Ajustes", "Abrir carpeta de datos", "Salir", "iniciado, mostrando datos del juego", "iniciado, esperando al juego") },
+            { "pt", Tray("Configurações", "Abrir pasta de dados", "Sair", "iniciado, mostrando dados do jogo", "iniciado, aguardando o jogo") },
+            { "it", Tray("Impostazioni", "Apri cartella dati", "Esci", "avviato, dati di gioco in visualizzazione", "avviato, in attesa del gioco") },
+            { "th", Tray("การตั้งค่า", "เปิดโฟลเดอร์ข้อมูล", "ออก", "เริ่มทำงานแล้ว กำลังแสดงข้อมูลเกม", "เริ่มทำงานแล้ว กำลังรอเกม") },
+            { "vi", Tray("Cài đặt", "Mở thư mục dữ liệu", "Thoát", "đã chạy, đang hiển thị dữ liệu game", "đã chạy, đang chờ game") },
+        };
+
+        private static Dictionary<string, string> Tray(string settings, string openData, string quit,
+            string running, string waiting)
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "tray_settings", settings }, { "tray_open", openData }, { "tray_quit", quit },
+                { "tray_running", running }, { "tray_waiting", waiting },
+            };
+        }
+
+        public static bool HasLang(string code)
+        {
+            return !string.IsNullOrEmpty(code) && TrayText.ContainsKey(code);
+        }
+
         public static string Row(string n) { return string.Format(L("row"), n); }
     }
 
@@ -331,7 +449,7 @@ namespace PBZStatsHud
         // Version shown in the tray tooltip/balloon. The Lua mod writes the real
         // version into stats.txt ("version="), so an updated mod never leaves a
         // stale number here; this is only the fallback before the first write.
-        internal const string FallbackVersion = "3.7.1";
+        internal const string FallbackVersion = "3.8.1";
 
         private static Config _cfg;
         private static string _exeDir;
@@ -363,9 +481,16 @@ namespace PBZStatsHud
         private static bool _hotkeyRegistered;
         private static DateTime _lastHotkeyUtc = DateTime.MinValue;
         private static volatile bool _forceRedraw;
+        // Cached boss fight state, read from stats.json (boss_active).
+        private static DateTime _bossJsonWrite = DateTime.MinValue;
+        private static bool _bossActive = true;
         // Language that stats.txt currently reports; the settings page and the
         // drag panel follow it the same way the HUD itself does.
         private static volatile string _uiLang = "en";
+        // Language used by the tray icon / tooltip / balloon. Defaults to the
+        // Windows display language (ui_lang=os) so the desktop notification
+        // matches the desktop even when the game runs in another language.
+        private static volatile string _noticeLang = "en";
 
         [STAThread]
         private static void Main(string[] args)
@@ -522,14 +647,14 @@ namespace PBZStatsHud
                 }
                 catch { }
             };
-            ToolStripMenuItem settingsItem = new ToolStripMenuItem("设置 / Settings");
+            ToolStripMenuItem settingsItem = new ToolStripMenuItem(UiText.L("tray_settings", Program.NoticeLang()));
             settingsItem.Click += delegate { OpenSettings(); };
-            ToolStripMenuItem openItem = new ToolStripMenuItem("打开数据文件夹 / Open data folder");
+            ToolStripMenuItem openItem = new ToolStripMenuItem(UiText.L("tray_open", Program.NoticeLang()));
             openItem.Click += delegate
             {
                 try { Process.Start("explorer.exe", _dataDir); } catch { }
             };
-            ToolStripMenuItem quitItem = new ToolStripMenuItem("退出 HUD / Quit");
+            ToolStripMenuItem quitItem = new ToolStripMenuItem(UiText.L("tray_quit", Program.NoticeLang()));
             quitItem.Click += delegate
             {
                 try { quit.Set(); } catch { }
@@ -543,7 +668,8 @@ namespace PBZStatsHud
             try
             {
                 ni.ShowBalloonTip(3000, "PBZStats HUD v" + ver,
-                    game ? "已启动，正在显示游戏数据" : "已启动，等待游戏启动",
+                    game ? UiText.L("tray_running", Program.NoticeLang())
+                         : UiText.L("tray_waiting", Program.NoticeLang()),
                     ToolTipIcon.Info);
             }
             catch { }
@@ -605,6 +731,10 @@ namespace PBZStatsHud
                 else
                     Log("settings hotkey unavailable: " + cfg.SettingsHotkey);
 
+                // Resolve the tray language before the first balloon is shown.
+                Program.RefreshUiLang();
+                Log("notice language: " + Program.NoticeLang() + " (ui_lang=" + cfg.UiLang
+                    + ", hud: " + Program.UiLang() + ", windows: " + Program.OsLangCode() + ")");
                 try { _tray = CreateTray(cfg, quit); }
                 catch (Exception ex) { Log("tray icon failed: " + ex.Message); }
 
@@ -834,6 +964,12 @@ namespace PBZStatsHud
         // poll ever has data (for example when started with --settings).
         internal static void RefreshUiLang()
         {
+            string forced = ForcedUiLang();
+            if (forced != null) { _uiLang = forced; _noticeLang = forced; return; }
+            if (_cfg != null && string.Equals(_cfg.UiLang, "os", StringComparison.OrdinalIgnoreCase))
+                _noticeLang = OsLangCode();
+            else
+                _noticeLang = _uiLang;
             try
             {
                 if (_dataDir == null) return;
@@ -842,9 +978,58 @@ namespace PBZStatsHud
                 Stats d = ParseStats(ReadStatsLines(p), DateTime.MinValue);
                 if (d == null) return;
                 string nl = Stats.Normalize(d.Lang);
-                if (nl != "auto" && nl != _uiLang) _uiLang = nl;
+                if (nl != "auto" && nl != _uiLang)
+                {
+                    _uiLang = nl;
+                    if (_cfg == null || !string.Equals(_cfg.UiLang, "os", StringComparison.OrdinalIgnoreCase))
+                        _noticeLang = nl;
+                }
             }
             catch { }
+        }
+
+        // ui_lang may force one language for both the settings page and the tray;
+        // "os"/"game"/"auto"/empty mean "decide per surface".
+        private static string ForcedUiLang()
+        {
+            try
+            {
+                if (_cfg == null) return null;
+                string v = (_cfg.UiLang ?? "").Trim().ToLowerInvariant();
+                if (v.Length == 0 || v == "os" || v == "game" || v == "auto") return null;
+                if (v == "zh-cn" || v == "zh-hans") return "zh";
+                if (v == "zh-tw" || v == "zh-hk" || v == "zh-hant") return "zht";
+                if (v.Length > 3) v = v.Substring(0, 2);
+                return UiText.HasLang(v) ? v : null;
+            }
+            catch { return null; }
+        }
+
+        // Windows display language (the language Explorer/dialogs use).
+        internal static string OsLangCode()
+        {
+            try
+            {
+                int id = Native.GetUserDefaultUILanguage();
+                switch (id & 0x3FF)
+                {
+                    case 0x04:
+                        int sub = (id >> 10) & 0x3F;
+                        return (sub == 1 || sub == 3) ? "zht" : "zh";   // zh-TW / zh-HK vs zh-CN
+                    case 0x11: return "ja";
+                    case 0x12: return "ko";
+                    case 0x19: return "ru";
+                    case 0x07: return "de";
+                    case 0x0C: return "fr";
+                    case 0x0A: return "es";
+                    case 0x16: return "pt";
+                    case 0x10: return "it";
+                    case 0x1E: return "th";
+                    case 0x2A: return "vi";
+                }
+            }
+            catch { }
+            return "en";
         }
 
         internal static void SaveConfig()
@@ -868,6 +1053,8 @@ namespace PBZStatsHud
         internal static List<Row> LastRows() { return _lastRows; }
         internal static Rectangle LastGameRect() { return _lastGameRect; }
         internal static string UiLang() { return _uiLang; }
+        // Language of the tray icon (menu / tooltip / balloon).
+        internal static string NoticeLang() { return string.IsNullOrEmpty(_noticeLang) ? _uiLang : _noticeLang; }
         internal static bool EditMode { get { return _editMode; } }
         internal static Config Cfg { get { return _cfg; } }
 
@@ -898,8 +1085,7 @@ namespace PBZStatsHud
             catch (Exception ex) { Log("enter edit mode failed: " + ex.Message); }
         }
 
-        internal static void EndEditPosition(bool apply)
-        {
+        internal static void EndEditPosition(bool apply)        {
             try
             {
                 EditForm f = _editForm;
@@ -916,6 +1102,22 @@ namespace PBZStatsHud
             SaveConfig();
             if (apply) Log("HUD position saved");
             Log("settings visible after edit = " + (_settingsForm != null && !_settingsForm.IsDisposed && _settingsForm.Visible));
+        }
+
+        // Called by the edit panel itself when it closes, whichever way that
+        // happened (Done, Esc, Alt+F4, task manager, an exception in a paint).
+        // Without it a panel that dies on its own leaves _editMode true and the
+        // layered HUD stays hidden - the mod looks frozen.
+        internal static void NoteEditFormClosed(object form)
+        {
+            try
+            {
+                if (form != null && ReferenceEquals(_editForm, form)) _editForm = null;
+                _editMode = false;
+                _forceRedraw = true;
+                Log("edit panel closed, HUD restored");
+            }
+            catch { }
         }
 
         private static void ApplyPendingTrayVersion()
@@ -1113,6 +1315,15 @@ namespace PBZStatsHud
 
                 // Free-position mode: the WinForms edit panel takes over, so the
                 // click-through layered window steps aside but the loop keeps polling.
+                // If the edit panel disappears without going through EndEditPosition
+                // (Alt+F4, a crash in the panel, ...) the HUD would stay hidden for
+                // ever and look dead - recover instead of freezing.
+                if (_editMode && (_editForm == null || _editForm.IsDisposed))
+                {
+                    _editMode = false;
+                    _forceRedraw = true;
+                    Log("edit mode auto-reset: the edit panel is gone");
+                }
                 if (_editMode)
                 {
                     if (visible)
@@ -1129,7 +1340,8 @@ namespace PBZStatsHud
                 {
                     List<Row> rows = data.Pick(cfg.Lang);
                     _lastRows = rows;
-                    List<Row> rowsShown = FilterRows(rows, cfg);
+                    bool bossOn = preview || ReadBossActive(_dataDir);
+                    List<Row> rowsShown = FilterRows(rows, cfg, bossOn);
                     if (rowsShown.Count == 0)
                     {
                         if (visible) { Native.ShowWindow(hwnd, Native.SW_HIDE); visible = false; lastKey = ""; }
@@ -1227,17 +1439,47 @@ namespace PBZStatsHud
         }
 
         // Rows the user hid on the settings page are dropped completely, so the
-        // remaining lines shift up instead of leaving a blank slot.
-        private static List<Row> FilterRows(List<Row> rows, Config cfg)
+        // remaining lines shift up instead of leaving a blank slot. Rows marked
+        // "auto" (the two boss lines by default) are only kept while a boss
+        // fight is running, which is what boss_active in stats.json reports.
+        private static List<Row> FilterRows(List<Row> rows, Config cfg, bool bossActive)
         {
             if (rows == null) return new List<Row>();
-            if (cfg == null || cfg.HiddenRows.Count == 0) return rows;
+            if (cfg == null) return rows;
+            if (cfg.HiddenRows.Count == 0 && cfg.AutoRows.Count == 0) return rows;
             List<Row> outp = new List<Row>(rows.Count);
             for (int i = 0; i < rows.Count; i++)
             {
-                if (!cfg.IsHidden(i)) outp.Add(rows[i]);
+                if (cfg.IsHidden(i)) continue;
+                if (!bossActive && cfg.IsAuto(i)) continue;
+                outp.Add(rows[i]);
             }
             return outp;
+        }
+
+        // stats.json carries the live boss fight state (written by the Lua mod
+        // next to stats.txt). The file is tiny, but the loop runs every poll
+        // tick, so the parsed value is cached by write time.
+        private static bool ReadBossActive(string dataDir)
+        {
+            try
+            {
+                string path = Path.Combine(dataDir, "stats.json");
+                if (!File.Exists(path)) return true;   // no json -> keep the rows visible
+                DateTime mtime = File.GetLastWriteTimeUtc(path);
+                if (mtime == _bossJsonWrite && (DateTime.UtcNow - mtime).TotalMilliseconds < 400)
+                    return _bossActive;
+                string text;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                {
+                    text = sr.ReadToEnd();
+                }
+                _bossJsonWrite = mtime;
+                _bossActive = text.IndexOf("\"boss_active\": true", StringComparison.OrdinalIgnoreCase) >= 0;
+                return _bossActive;
+            }
+            catch { return _bossActive; }
         }
 
         private static Stats ParseStats(string[] lines, DateTime lastWrite)
@@ -1484,6 +1726,9 @@ namespace PBZStatsHud
             private readonly TextBox _hotkeyBox;
             private readonly Label _hotkeyState;
             private readonly TextBox _fontBox;
+            // Invisible 1x1 panel that takes the initial focus, so the panel opens
+            // with the hotkey box (or any checkbox) unfocused.
+            private readonly Panel _focusSink = new Panel();
             private readonly List<CheckBox> _rowChecks = new List<CheckBox>();
             private readonly List<int> _rowIndexes = new List<int>();
             private Point _dragStart;
@@ -1511,6 +1756,14 @@ namespace PBZStatsHud
                 ClientSize = new Size(width, height);
                 if (game.Width > 200)
                     Location = new Point(game.Left + (game.Width - width) / 2, game.Top + Math.Max(40, (game.Height - height) / 3));
+
+                // 1x1 sink so the form opens without focusing a text box (typing a
+                // key used to overwrite the hotkey) or a checkbox.
+                _focusSink.TabStop = true;
+                _focusSink.Size = new Size(1, 1);
+                _focusSink.Location = new Point(2, 2);
+                _focusSink.BackColor = BgColor;
+                Controls.Add(_focusSink);
 
                 Label title = new Label();
                 title.Text = UiText.L("title");
@@ -1594,6 +1847,68 @@ namespace PBZStatsHud
                     Controls.Add(cb);
                     _rowChecks.Add(cb);
                     _rowIndexes.Add(i);
+
+                    // The two boss rows (index 3 and 4) can follow the boss
+                    // fight instead of being always visible. The checkbox above
+                    // still decides whether the row exists at all.
+                    if (i == 3 || i == 4)
+                    {
+                        // A Button paints its caption from the font baseline and
+                        // cuts whatever hangs below it: at 24/26 px the bottom
+                        // stroke of glyphs like 显 was always missing, no matter
+                        // which font size or padding was used. Radio buttons draw
+                        // their caption as ordinary label text, so nothing gets
+                        // clipped, and they express "pick one" natively.
+                        Panel modeRow = new Panel();
+                        modeRow.BackColor = BgColor;
+                        modeRow.Location = new Point(266, y + i * 30 - 1);
+                        modeRow.Size = new Size(160, 24);
+
+                        RadioButton rAuto = new ModeRadio();
+                        rAuto.Text = UiText.L("auto");
+                        ((ModeRadio)rAuto).LabelText = UiText.L("auto");
+                        rAuto.AutoSize = false;
+                        rAuto.Font = new Font("Microsoft YaHei UI", 10.5f);
+                        rAuto.Size = new Size(78, 24);
+                        rAuto.ForeColor = TextColor;
+                        rAuto.BackColor = BgColor;
+                        rAuto.UseVisualStyleBackColor = false;
+                        rAuto.TabStop = false;
+                        rAuto.Location = new Point(0, 1);
+                        rAuto.Checked = _cfg.IsAuto(i);
+
+                        RadioButton rAlways = new ModeRadio();
+                        rAlways.Text = UiText.L("always");
+                        ((ModeRadio)rAlways).LabelText = UiText.L("always");
+                        rAlways.AutoSize = false;
+                        rAlways.Font = new Font("Microsoft YaHei UI", 10.5f);
+                        rAlways.Size = new Size(92, 24);
+                        rAlways.ForeColor = TextColor;
+                        rAlways.BackColor = BgColor;
+                        rAlways.UseVisualStyleBackColor = false;
+                        rAlways.TabStop = false;
+                        rAlways.Location = new Point(82, 1);
+                        rAlways.Checked = !_cfg.IsAuto(i);
+
+                        MarkModeRadios(rAuto, rAlways);
+
+                        rAuto.CheckedChanged += delegate
+                        {
+                            if (!rAuto.Checked) return;
+                            MarkModeRadios(rAuto, rAlways);
+                            SetAutoRow(index, true);
+                        };
+                        rAlways.CheckedChanged += delegate
+                        {
+                            if (!rAlways.Checked) return;
+                            MarkModeRadios(rAuto, rAlways);
+                            SetAutoRow(index, false);
+                        };
+
+                        modeRow.Controls.Add(rAuto);
+                        modeRow.Controls.Add(rAlways);
+                        Controls.Add(modeRow);
+                    }
                 }
                 y += count * 30 + 14;
 
@@ -1674,6 +1989,22 @@ namespace PBZStatsHud
                 KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
             }
 
+            // Opening the panel used to put the caret into the hotkey box, so the
+            // first key press was captured as a new hotkey. Nothing should own the
+            // focus: clear it once the window is actually on screen.
+            protected override void OnShown(EventArgs e)
+            {
+                base.OnShown(e);
+                try
+                {
+                    ActiveControl = null;
+                    if (_hotkeyBox != null) _hotkeyBox.TabStop = false;
+                    if (_fontBox != null) _fontBox.TabStop = false;
+                    _focusSink.Focus();
+                }
+                catch { }
+            }
+
             private void AddCaption(string text, int x, int y)
             {
                 Label l = new Label();
@@ -1726,6 +2057,35 @@ namespace PBZStatsHud
                 }
             }
 
+            // Boss rows: "auto" (only during a boss fight) vs "always".
+            // The two radio buttons are mutually exclusive and saved immediately.
+            private void SetAutoRow(int index, bool auto)
+            {
+                try
+                {
+                    bool has = _cfg.AutoRows.Contains(index);
+                    if (auto && !has) _cfg.AutoRows.Add(index);
+                    else if (!auto && has) _cfg.AutoRows.Remove(index);
+                    Program.SaveConfig();
+                    _forceRedraw = true;
+                }
+                catch { }
+            }
+
+            private static void MarkModeRadios(RadioButton autoBtn, RadioButton alwaysBtn)
+            {
+                if (autoBtn != null)
+                {
+                    autoBtn.ForeColor = autoBtn.Checked ? AccentColor : TextColor;
+                    autoBtn.Invalidate();
+                }
+                if (alwaysBtn != null)
+                {
+                    alwaysBtn.ForeColor = alwaysBtn.Checked ? AccentColor : TextColor;
+                    alwaysBtn.Invalidate();
+                }
+            }
+
             private void OnHotkeyKeyDown(object sender, KeyEventArgs e)
             {
                 string text = Program.HotkeyFromKey(e.KeyCode, e.Modifiers);
@@ -1775,6 +2135,55 @@ namespace PBZStatsHud
         // Free-position mode: a real WinForms panel that shows the HUD rows,
         // a font-size strip and a "Done" button. The panel itself is dragged.
         // ------------------------------------------------------------------
+        // Radio button whose caption is drawn by hand with GDI+.
+        //
+        // Why not the stock caption: Button/RadioButton paint their text through
+        // the GDI font grid, which at small sizes and at 125 % DPI drops thin CJK
+        // strokes (the label looked "broken" no matter the font size or padding)
+        // and clips ink below the baseline. Graphics.DrawString rasterises the
+        // same glyphs with ClearType, so every stroke survives at any DPI.
+        private sealed class ModeRadio : RadioButton
+        {
+            internal string LabelText = "";
+            internal Color Accent = Color.FromArgb(232, 195, 106);
+
+            internal ModeRadio()
+            {
+                Text = "";
+                AutoSize = false;
+                TabStop = false;
+                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(BackColor);
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+                int d = 13;
+                int cy = Height / 2;
+                Rectangle circle = new Rectangle(1, cy - d / 2, d, d);
+                using (Pen p = new Pen(Checked ? Accent : Color.FromArgb(125, 131, 143), 1.4f))
+                    g.DrawEllipse(p, circle);
+                if (Checked)
+                {
+                    using (SolidBrush b = new SolidBrush(Accent))
+                        g.FillEllipse(b, new Rectangle(circle.X + 3, circle.Y + 3, d - 6, d - 6));
+                }
+
+                using (SolidBrush tb = new SolidBrush(ForeColor))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.Alignment = StringAlignment.Near;
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.FormatFlags = StringFormatFlags.NoWrap;
+                    g.DrawString(LabelText, Font, tb, new RectangleF(d + 5, 0, Width - d - 6, Height), sf);
+                }
+            }
+        }
+
         private sealed class EditForm : Form
         {
             private const int StripH = 44;
@@ -1977,15 +2386,20 @@ namespace PBZStatsHud
             protected override void OnFormClosed(FormClosedEventArgs e)
             {
                 try { if (_rowsBmp != null) { _rowsBmp.Dispose(); _rowsBmp = null; } } catch { }
+                // Leaving free-position mode must never depend on which button or
+                // key closed the panel; otherwise the HUD stays hidden and the mod
+                // looks unresponsive.
+                try { Program.NoteEditFormClosed(this); } catch { }
                 base.OnFormClosed(e);
             }
         }
 
         // The edit panel draws the same rows as the HUD, so it uses the same
-        // filter helper from the worker side.
+        // filter helper from the worker side. The drag panel always shows the
+        // "auto" rows as well, so you can position them before a boss fight.
         internal static List<Row> FilterRowsPublic(List<Row> rows, Config cfg)
         {
-            return FilterRows(rows, cfg);
+            return FilterRows(rows, cfg, true);
         }
     }
 
@@ -2016,6 +2430,11 @@ namespace PBZStatsHud
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        // Windows display language (LANGID): used when ui_lang=os so the tray
+        // notification matches the desktop instead of the in-game language.
+        [DllImport("kernel32.dll")]
+        public static extern ushort GetUserDefaultUILanguage();
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UnregisterHotKey(IntPtr hWnd, int id);

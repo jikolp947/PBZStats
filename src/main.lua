@@ -35,7 +35,7 @@
 -- Release version of the mod (shown in the tray notification and written to
 -- stats.txt/json so the HUD exe can display it). Keep in sync with install.ps1
 -- and the Nexus file version when publishing.
-local MOD_VERSION = "3.7.1"
+local MOD_VERSION = "3.8.1"
 
 local OUT = "E:\\PBZModOut\\"
 local STATS_PATH = OUT .. "stats.json"
